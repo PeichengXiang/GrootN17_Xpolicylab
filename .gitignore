@@ -16,3 +16,8 @@ policy/H_RDT/H_RDT/.cache/
 policy/H_RDT/H_RDT/t5-v1_1-xxl/
 policy/H_RDT/**/logs/
 policy/H_RDT/**/wandb/
+
+# Local datasets and reusable virtual environments
+data/
+**/.venv
+pretrain_model/hf_home
