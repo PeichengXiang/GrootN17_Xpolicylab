@@ -24,6 +24,15 @@ data_setting="${bench_name}-${ckpt_name}-${env_cfg_type}-${action_type}"
 dataset_path="${DATA_ROOT}/${data_setting}"
 modality_config="${POLICY_DIR}/configs/${env_cfg_type}_config.py"
 
+if [[ "${env_cfg_type}" == "tianji_marvin_wuji" ]]; then
+  exec "${POLICY_DIR}/scripts/convert_spark0_hdf5_to_groot_v21.sh" \
+    "${bench_name}" \
+    "${ckpt_name}" \
+    "${env_cfg_type}" \
+    "${action_type}" \
+    "${expert_data_num:-100}"
+fi
+
 resolve_src_dataset() {
   if [[ -n "${GR00T_SRC_DATASET:-}" ]]; then
     echo "${GR00T_SRC_DATASET}"

@@ -3,6 +3,7 @@ from __future__ import annotations
 import importlib.util
 import json
 import sys
+import warnings
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -11,10 +12,19 @@ import numpy as np
 
 from XPolicyLab.model_template import ModelTemplate
 from XPolicyLab.utils.checkpoint_resolver import resolve_checkpoint_root
+from XPolicyLab.utils.process_data import (
+    get_robot_action_dim_info,
+    pack_robot_state,
+    unpack_robot_state,
+)
 
 _POLICY_DIR = Path(__file__).resolve().parent
 _GR00T_ROOT = _POLICY_DIR / "gr00t_n17"
 _CHECKPOINTS_DIR = _POLICY_DIR / "checkpoints"
+_ENV_CFG_DIR = (
+    Path(get_robot_action_dim_info.__code__.co_filename).resolve().parent / "../../env_cfg"
+).resolve()
+_ROBOT_INFO_PATH = _POLICY_DIR.parents[1] / "utils" / "robot" / "_robot_info.json"
 
 if str(_GR00T_ROOT) not in sys.path:
     sys.path.insert(0, str(_GR00T_ROOT))
@@ -29,11 +39,69 @@ VIDEO_KEY_CANDIDATES = {
 }
 
 
+def _validate_robot_action_dim_info(
+    env_cfg_type: str,
+    value: Any,
+) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise TypeError(
+            f"Robot metadata for {env_cfg_type!r} must be an object, got {type(value).__name__}."
+        )
+
+    validated = dict(value)
+    for field in ("arm_dim", "ee_dim"):
+        dimensions = value.get(field)
+        if not isinstance(dimensions, list) or len(dimensions) != 2:
+            raise ValueError(
+                f"Robot metadata for {env_cfg_type!r} must define {field} as two dimensions, "
+                f"got {dimensions!r}."
+            )
+        if any(
+            not isinstance(dimension, int)
+            or isinstance(dimension, bool)
+            or dimension <= 0
+            for dimension in dimensions
+        ):
+            raise ValueError(
+                f"Robot metadata for {env_cfg_type!r} has invalid {field}: {dimensions!r}."
+            )
+        validated[field] = list(dimensions)
+    return validated
+
+
+def _resolve_robot_action_dim_info(env_cfg_type: str) -> dict[str, Any]:
+    """Resolve the normal env config first, then the tracked robot schema by name."""
+    try:
+        metadata = get_robot_action_dim_info(env_cfg_type)
+    except FileNotFoundError as exc:
+        expected_missing_path = (_ENV_CFG_DIR / f"{env_cfg_type}.yml").resolve()
+        actual_missing_path = Path(exc.filename).resolve() if exc.filename else None
+        if actual_missing_path != expected_missing_path:
+            raise
+        with open(_ROBOT_INFO_PATH, encoding="utf-8") as file:
+            tracked_robot_info = json.load(file)
+        if not isinstance(tracked_robot_info, dict):
+            raise TypeError(f"Tracked robot metadata must be an object: {_ROBOT_INFO_PATH}")
+        if env_cfg_type not in tracked_robot_info:
+            raise KeyError(
+                f"Robot {env_cfg_type!r} is absent from tracked metadata {_ROBOT_INFO_PATH}."
+            )
+        metadata = tracked_robot_info[env_cfg_type]
+        warnings.warn(
+            f"Environment config {env_cfg_type!r} was not found; using the tracked robot "
+            f"schema in {_ROBOT_INFO_PATH}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    return _validate_robot_action_dim_info(env_cfg_type, metadata)
+
+
 def _load_modality_config(env_cfg_type: str) -> None:
     config_path = _POLICY_DIR / "configs" / f"{env_cfg_type}_config.py"
     if not config_path.is_file():
         raise FileNotFoundError(
-            f"Modality config not found: {config_path}. Run process_data.sh for env_cfg_type={env_cfg_type} first."
+            f"Modality config not found: {config_path}. "
+            f"Run process_data.sh for env_cfg_type={env_cfg_type} first."
         )
     spec = importlib.util.spec_from_file_location(f"gr00t_modality_{env_cfg_type}", config_path)
     if spec is None or spec.loader is None:
@@ -248,22 +316,96 @@ def _extract_prompt(observation: dict[str, Any], default_prompt: str) -> str:
     return default_prompt
 
 
-def _pack_arm_state(observation: dict[str, Any], side: str) -> np.ndarray:
-    state = observation.get("state", {})
-    prefix = f"{side}_"
-    joint = _as_1d(state[f"{prefix}arm_joint_state"], 6)
-    gripper = _as_1d(state[f"{prefix}ee_joint_state"], 1)
-    return np.concatenate([joint, gripper], axis=0).astype(np.float32)
+def _physical_group_dims(robot_action_dim_info: dict[str, Any]) -> list[tuple[str, int]]:
+    arm_dims = list(robot_action_dim_info.get("arm_dim", []))
+    ee_dims = list(robot_action_dim_info.get("ee_dim", []))
+    if len(arm_dims) != 2 or len(ee_dims) != 2:
+        raise ValueError(
+            "GR00T_N17 XPolicyLab integration requires a dual-arm robot; "
+            f"got arm_dim={arm_dims}, ee_dim={ee_dims}."
+        )
+
+    group_dims: list[tuple[str, int]] = []
+    for side, arm_dim, ee_dim in zip(("left", "right"), arm_dims, ee_dims):
+        if not isinstance(arm_dim, int) or not isinstance(ee_dim, int):
+            raise TypeError(
+                f"Robot dimensions must be integers, got arm={arm_dim!r}, ee={ee_dim!r}."
+            )
+        if arm_dim <= 0 or ee_dim <= 0:
+            raise ValueError(f"Robot dimensions must be positive, got arm={arm_dim}, ee={ee_dim}.")
+
+        if ee_dim == 1:
+            # Preserve the existing ARX checkpoint ABI exactly: arm + scalar
+            # gripper live in one group per side.
+            group_dims.append((f"{side}_arm", arm_dim + ee_dim))
+        else:
+            group_dims.extend(
+                [
+                    (f"{side}_arm", arm_dim),
+                    (f"{side}_hand", ee_dim),
+                ]
+            )
+    return group_dims
 
 
-def _encode_observation(obs: dict[str, Any], default_prompt: str) -> dict[str, Any]:
+def _gr00t_group_dims(robot_action_dim_info: dict[str, Any]) -> list[tuple[str, int]]:
+    physical_groups = _physical_group_dims(robot_action_dim_info)
+    if all(name in {"left_arm", "right_arm"} for name, _ in physical_groups):
+        return physical_groups
+
+    by_name = dict(physical_groups)
+    modality_order = ("left_arm", "right_arm", "left_hand", "right_hand")
+    if set(by_name) != set(modality_order):
+        raise ValueError(f"Unsupported GR00T modality groups: {list(by_name)}")
+    return [(name, by_name[name]) for name in modality_order]
+
+
+def _pack_state_groups(
+    observation: dict[str, Any],
+    action_type: str,
+    robot_action_dim_info: dict[str, Any],
+) -> dict[str, np.ndarray]:
+    if action_type != "joint":
+        raise ValueError(
+            "GR00T_N17 is configured for joint-space relative actions "
+            f"(action_type=joint), got {action_type!r}."
+        )
+
+    physical_groups = _physical_group_dims(robot_action_dim_info)
+    total_dim = sum(dim for _, dim in physical_groups)
+    packed = _as_1d(
+        pack_robot_state(
+            observation,
+            action_type=action_type,
+            robot_action_dim_info=robot_action_dim_info,
+            source_type="obs",
+        ),
+        total_dim,
+    ).astype(np.float32)
+
+    groups_by_name: dict[str, np.ndarray] = {}
+    offset = 0
+    for group_name, group_dim in physical_groups:
+        groups_by_name[group_name] = packed[offset : offset + group_dim]
+        offset += group_dim
+    return {
+        group_name: groups_by_name[group_name]
+        for group_name, _ in _gr00t_group_dims(robot_action_dim_info)
+    }
+
+
+def _encode_observation(
+    obs: dict[str, Any],
+    default_prompt: str,
+    action_type: str,
+    robot_action_dim_info: dict[str, Any],
+) -> dict[str, Any]:
     images = {
         video_key: _to_rgb_hwc(_extract_image(obs, candidates))
         for video_key, candidates in VIDEO_KEY_CANDIDATES.items()
     }
     prompt = _extract_prompt(obs, default_prompt)
-    left_arm = _pack_arm_state(obs, "left")
-    right_arm = _pack_arm_state(obs, "right")
+    state_groups = _pack_state_groups(obs, action_type, robot_action_dim_info)
 
     return {
         "video": {
@@ -271,8 +413,7 @@ def _encode_observation(obs: dict[str, Any], default_prompt: str) -> dict[str, A
             for key, image in images.items()
         },
         "state": {
-            "left_arm": left_arm[None, None, :],
-            "right_arm": right_arm[None, None, :],
+            key: value[None, None, :] for key, value in state_groups.items()
         },
         "language": {
             "annotation.human.task_description": [[prompt]],
@@ -280,38 +421,63 @@ def _encode_observation(obs: dict[str, Any], default_prompt: str) -> dict[str, A
     }
 
 
-def _gr00t_action_to_env(action: dict[str, np.ndarray], action_type: str) -> list[dict[str, np.ndarray]]:
-    left_arm = np.asarray(action["left_arm"][0], dtype=np.float32)
-    right_arm = np.asarray(action["right_arm"][0], dtype=np.float32)
-    horizon = left_arm.shape[0]
-
+def _gr00t_action_to_env(
+    action: dict[str, np.ndarray],
+    action_type: str,
+    robot_action_dim_info: dict[str, Any],
+) -> list[dict[str, np.ndarray]]:
     if action_type != "joint":
         raise ValueError(
-            f"GR00T_N17 RoboDojo arx_x5 is trained with joint-space relative actions (action_type=joint). "
-            f"Got action_type={action_type!r}."
+            "GR00T_N17 is configured for joint-space relative actions "
+            f"(action_type=joint), got {action_type!r}."
         )
 
-    action_list: list[dict[str, np.ndarray]] = []
-    for step in range(horizon):
-        left = left_arm[step]
-        right = right_arm[step]
-        action_list.append(
-            {
-                "left_arm_joint_state": left[:6].astype(np.float32),
-                "left_ee_joint_state": left[6:7].astype(np.float32),
-                "right_arm_joint_state": right[:6].astype(np.float32),
-                "right_ee_joint_state": right[6:7].astype(np.float32),
-            }
-        )
-    return action_list
+    groups_by_name: dict[str, np.ndarray] = {}
+    horizon: int | None = None
+    for group_name, group_dim in _gr00t_group_dims(robot_action_dim_info):
+        if group_name not in action:
+            raise KeyError(f"GR00T action is missing modality group {group_name!r}.")
+        group = np.asarray(action[group_name][0], dtype=np.float32)
+        if group.ndim != 2 or group.shape[1] != group_dim:
+            raise ValueError(
+                f"GR00T action group {group_name!r} must have shape [T, {group_dim}], "
+                f"got {group.shape}."
+            )
+        if horizon is None:
+            horizon = group.shape[0]
+        elif group.shape[0] != horizon:
+            raise ValueError(
+                f"GR00T action horizon mismatch for {group_name!r}: "
+                f"expected {horizon}, got {group.shape[0]}."
+            )
+        groups_by_name[group_name] = group
+
+    packed_action = np.concatenate(
+        [groups_by_name[name] for name, _ in _physical_group_dims(robot_action_dim_info)],
+        axis=-1,
+    )
+    unpacked = unpack_robot_state(
+        packed_action,
+        action_type=action_type,
+        robot_action_dim_info=robot_action_dim_info,
+        source_type="obs",
+    )
+    return [
+        {key: np.asarray(value, dtype=np.float32) for key, value in step.items()}
+        for step in unpacked
+    ]
 
 
 class Model(ModelTemplate):
     def __init__(self, model_cfg: dict[str, Any]):
         self.model_cfg = model_cfg
         self.action_type = model_cfg.get("action_type", "joint")
-        self.default_prompt = model_cfg.get("default_prompt", model_cfg.get("task_name", "Perform the robot manipulation task."))
+        self.default_prompt = model_cfg.get(
+            "default_prompt",
+            model_cfg.get("task_name", "Perform the robot manipulation task."),
+        )
         self.env_cfg_type = model_cfg["env_cfg_type"]
+        self.robot_action_dim_info = _resolve_robot_action_dim_info(self.env_cfg_type)
         self.device = model_cfg.get("device", "cuda:0" if self._has_cuda() else "cpu")
 
         _load_modality_config(self.env_cfg_type)
@@ -327,6 +493,15 @@ class Model(ModelTemplate):
                 strict=True,
             )
         self.model = self.policy
+        expected_groups = [name for name, _ in _gr00t_group_dims(self.robot_action_dim_info)]
+        for modality in ("state", "action"):
+            actual_groups = list(self.policy.modality_configs[modality].modality_keys)
+            if actual_groups != expected_groups:
+                raise ValueError(
+                    f"Checkpoint {modality} modalities {actual_groups} do not match "
+                    f"env_cfg_type={self.env_cfg_type!r} metadata groups {expected_groups}. "
+                    "Use a checkpoint trained for this robot schema."
+                )
         self.action_horizon = len(self.policy.modality_configs["action"].delta_indices)
 
         self._obs_list: list[dict[str, Any]] = []
@@ -334,6 +509,7 @@ class Model(ModelTemplate):
 
         print(f"[GR00T_N17] Loaded checkpoint from {checkpoint_dir}")
         print(f"[GR00T_N17] cosmos_model={cosmos_model}")
+        print(f"[GR00T_N17] action_groups={expected_groups}")
         print(f"[GR00T_N17] action_horizon={self.action_horizon}, embodiment_tag={embodiment_tag}")
 
     @staticmethod
@@ -349,8 +525,18 @@ class Model(ModelTemplate):
         self.update_obs_batch([obs])
 
     def update_obs_batch(self, obs_list):
-        self._latest_env_idx_list = [obs.get("env_idx", index) for index, obs in enumerate(obs_list)]
-        self._obs_list = [_encode_observation(obs, self.default_prompt) for obs in obs_list]
+        self._latest_env_idx_list = [
+            obs.get("env_idx", index) for index, obs in enumerate(obs_list)
+        ]
+        self._obs_list = [
+            _encode_observation(
+                obs,
+                self.default_prompt,
+                self.action_type,
+                self.robot_action_dim_info,
+            )
+            for obs in obs_list
+        ]
 
     def get_action(self, **kwargs):
         if not self._obs_list:
@@ -364,7 +550,13 @@ class Model(ModelTemplate):
         action_list = []
         for encoded_obs in self._obs_list:
             gr00t_action, _ = self.policy.get_action(encoded_obs, **kwargs)
-            action_list.append(_gr00t_action_to_env(gr00t_action, self.action_type))
+            action_list.append(
+                _gr00t_action_to_env(
+                    gr00t_action,
+                    self.action_type,
+                    self.robot_action_dim_info,
+                )
+            )
         return action_list
 
     def reset(self):
