@@ -4,9 +4,10 @@
 from __future__ import annotations
 
 import argparse
-import functools
 import importlib.metadata
 import json
+import shutil
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -36,21 +37,57 @@ WIDTH = 640
 FPS = 25
 JOINT_DIM = 54
 VIDEO_CODEC = "h264"
+VIDEO_ENCODING_WORKERS = 3
+
+
+def _encode_episode_videos_h264(dataset: LeRobotDataset, episode_index: int) -> None:
+    """Encode the three independent camera streams concurrently as H.264."""
+
+    jobs: list[tuple[Path, Path]] = []
+    for key in dataset.meta.video_keys:
+        video_path = dataset.root / dataset.meta.get_video_file_path(episode_index, key)
+        if video_path.is_file():
+            continue
+        image_dir = dataset._get_image_file_path(
+            episode_index=episode_index,
+            image_key=key,
+            frame_index=0,
+        ).parent
+        jobs.append((image_dir, video_path))
+
+    def encode(job: tuple[Path, Path]) -> None:
+        image_dir, video_path = job
+        encode_video_frames(
+            image_dir,
+            video_path,
+            dataset.fps,
+            vcodec=VIDEO_CODEC,
+            log_level=None,
+            overwrite=True,
+        )
+
+    if jobs:
+        with ThreadPoolExecutor(max_workers=min(VIDEO_ENCODING_WORKERS, len(jobs))) as executor:
+            list(executor.map(encode, jobs))
+        for image_dir, _ in jobs:
+            shutil.rmtree(image_dir)
+
+    if dataset.meta.video_keys and episode_index == 0:
+        dataset.meta.update_video_info()
+        lerobot_dataset_module.write_info(dataset.meta.info, dataset.meta.root)
 
 
 def _configure_video_encoding() -> None:
     """Use H.264 for LeRobot v2.1 episode files.
 
     LeRobot 0.3.3's ``video_backend`` argument selects the decoder; its writer
-    otherwise calls ``encode_video_frames`` with the libsvtav1 default. Bind the
-    converter-local symbol used by ``LeRobotDataset`` instead of modifying the
-    installed package or any GR00T data-loading code.
+    otherwise calls ``encode_video_frames`` with the libsvtav1 default. Replace
+    the encoder method only in this conversion process, and encode the three
+    independent camera streams concurrently. The installed package and GR00T
+    data-loading code remain unchanged.
     """
 
-    lerobot_dataset_module.encode_video_frames = functools.partial(
-        encode_video_frames,
-        vcodec=VIDEO_CODEC,
-    )
+    LeRobotDataset.encode_episode_videos = _encode_episode_videos_h264
 
 
 def _add_frame_compat(dataset: LeRobotDataset, frame: dict[str, Any], task: str) -> None:
