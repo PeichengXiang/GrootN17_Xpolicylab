@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import functools
 import importlib.metadata
 import json
 from pathlib import Path
@@ -11,7 +12,9 @@ from typing import Any
 
 import h5py
 import numpy as np
+import lerobot.datasets.lerobot_dataset as lerobot_dataset_module
 from lerobot.datasets.lerobot_dataset import HF_LEROBOT_HOME, LeRobotDataset
+from lerobot.datasets.video_utils import encode_video_frames
 from XPolicyLab.utils import process_data
 
 
@@ -32,6 +35,22 @@ HEIGHT = 480
 WIDTH = 640
 FPS = 25
 JOINT_DIM = 54
+VIDEO_CODEC = "h264"
+
+
+def _configure_video_encoding() -> None:
+    """Use H.264 for LeRobot v2.1 episode files.
+
+    LeRobot 0.3.3's ``video_backend`` argument selects the decoder; its writer
+    otherwise calls ``encode_video_frames`` with the libsvtav1 default. Bind the
+    converter-local symbol used by ``LeRobotDataset`` instead of modifying the
+    installed package or any GR00T data-loading code.
+    """
+
+    lerobot_dataset_module.encode_video_frames = functools.partial(
+        encode_video_frames,
+        vcodec=VIDEO_CODEC,
+    )
 
 
 def _add_frame_compat(dataset: LeRobotDataset, frame: dict[str, Any], task: str) -> None:
@@ -229,6 +248,8 @@ def main() -> None:
     if output.name.startswith(".") or "/" in output.name:
         raise ValueError(f"Unsafe output dataset name: {output.name!r}")
 
+    _configure_video_encoding()
+    print(f"Video codec: {VIDEO_CODEC}", flush=True)
     episode_files = _validate_source_root(source_root)
     dataset = _create_dataset(output.name, args.image_writer_threads)
     manifest = []

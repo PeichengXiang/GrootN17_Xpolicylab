@@ -53,10 +53,11 @@ FPS = 25
 HEIGHT = 480
 WIDTH = 640
 JOINT_DIM = 54
+VIDEO_CODEC = "h264"
 FULL_EPISODES = 600
 FULL_FRAMES = 151410
 MARKER_RELATIVE_PATH = Path("meta/spark0_joint54_audit.json")
-MARKER_VERSION = 2
+MARKER_VERSION = 3
 
 
 def _require(condition: bool, message: str) -> None:
@@ -234,6 +235,7 @@ def _check_metadata(
         _require(video_info["video.width"] == WIDTH, f"{key} width mismatch")
         _require(video_info["video.fps"] == FPS, f"{key} fps mismatch")
         _require(video_info["video.channels"] == 3, f"{key} channel mismatch")
+        _require(video_info["video.codec"] == VIDEO_CODEC, f"{key} codec mismatch")
 
     expected_ranges = {
         key: {"start": start, "end": end}
@@ -464,13 +466,14 @@ def _check_videos(dataset: Path, context: dict[str, Any], workers: int) -> None:
             _require(int(stream["height"]) == HEIGHT, f"Video height mismatch: {path}")
             _require(Fraction(stream["r_frame_rate"]) == FPS, f"Video FPS mismatch: {path}")
             _require(Fraction(stream["avg_frame_rate"]) == FPS, f"Average FPS mismatch: {path}")
-            _require(stream["codec_name"] == "av1", f"Video codec mismatch: {path}")
+            _require(stream["codec_name"] == VIDEO_CODEC, f"Video codec mismatch: {path}")
             _require(stream["pix_fmt"] == "yuv420p", f"Video pixel format mismatch: {path}")
             _require(path.stat().st_size > 0, f"Empty video: {path}")
 
     _require(len(seen) == expected_count, "Video coverage mismatch")
     print(
-        f"FFPROBE_ALL_OK files={expected_count} fps={FPS} resolution={WIDTH}x{HEIGHT} codec=av1",
+        f"FFPROBE_ALL_OK files={expected_count} fps={FPS} "
+        f"resolution={WIDTH}x{HEIGHT} codec={VIDEO_CODEC}",
         flush=True,
     )
 
@@ -657,6 +660,7 @@ def _write_marker(
         "videos": context["episode_count"] * len(VIDEO_MAP),
         "fps": FPS,
         "joint_dim": JOINT_DIM,
+        "video_codec": VIDEO_CODEC,
         "source_root": str(source_root),
         "source_manifest_sha256": _sha256_file(context["manifest_path"]),
         "modality_config_sha256": _sha256_file(config_path),
@@ -665,6 +669,7 @@ def _write_marker(
         "checks": {
             "parquet_episodes_exact": context["episode_count"],
             "ffprobe_videos": context["episode_count"] * len(VIDEO_MAP),
+            "video_codec": VIDEO_CODEC,
             "stats": "absolute54+relative-arms-2x16x7",
             "official_loader": {
                 "pyav_episode_indices": sample_indices,
@@ -690,6 +695,7 @@ def _verify_marker(dataset: Path, config_path: Path | None, require_full: bool) 
     _require(marker["dataset_name"] == dataset.name, "Dataset identity/name mismatch")
     _require(marker["robot_type"] == "tianji_marvin_wuji", "Audit robot mismatch")
     _require(marker["fps"] == FPS and marker["joint_dim"] == JOINT_DIM, "Audit schema mismatch")
+    _require(marker["video_codec"] == VIDEO_CODEC, "Audit video codec mismatch")
     _require(marker["tasks"] == len(TASKS), "Audit task count mismatch")
     _require(
         marker["audit_script_sha256"] == _sha256_file(Path(__file__).resolve()),
