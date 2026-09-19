@@ -35,6 +35,7 @@ Returns messages with VLAStepData as defined in types.py.
 from collections import defaultdict
 import json
 import logging
+import os
 from pathlib import Path
 import random
 from typing import Any
@@ -222,6 +223,13 @@ class LeRobotEpisodeLoader:
         self, episode_id: int, nominal_length: int
     ) -> int:
         """Align episode length with available video frames."""
+        # Some converted datasets carry an independent, lossless video-frame
+        # audit.  In that case spawning one ffprobe process per camera/episode
+        # is unnecessary (and very expensive on a shared filesystem).  Keep the
+        # historical probing behavior as the default; callers must explicitly
+        # opt in after validating their dataset.
+        if os.environ.get("GR00T_TRUST_VIDEO_LENGTHS", "0") == "1":
+            return nominal_length
         actual_length = nominal_length
         if "video" in self.modality_configs:
             video_lengths = []

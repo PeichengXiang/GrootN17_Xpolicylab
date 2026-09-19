@@ -2,7 +2,10 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
+import shutil
 import sys
+import tempfile
 import warnings
 from contextlib import contextmanager
 from pathlib import Path
@@ -12,6 +15,7 @@ import numpy as np
 
 from XPolicyLab.model_template import ModelTemplate
 from XPolicyLab.utils.checkpoint_resolver import resolve_checkpoint_root
+from XPolicyLab.utils.checkpoint_io import network_checkpoint_view
 from XPolicyLab.utils.process_data import (
     get_robot_action_dim_info,
     pack_robot_state,
@@ -37,6 +41,28 @@ VIDEO_KEY_CANDIDATES = {
     "left_wrist": ["cam_left_wrist", "left_camera", "left_wrist", "wrist_left"],
     "right_wrist": ["cam_right_wrist", "right_camera", "right_wrist", "wrist_right"],
 }
+
+EGO_VLA_RAW_IMAGE_SHAPE = (384, 384, 3)
+EGO_VLA_REAL_WRIST_PROMPT = (
+    "Insert the left can into the slot and insert the right can into the slot, "
+    "unload the left cans andd then unload the right cans"
+)
+EGO_VLA_TASK_PROMPTS = frozenset(
+    {
+        "pour balls in cup into bowl",
+        "push box to the marker",
+        "Put sprite cans to the left box, and orange cans to the right box",
+        "Insert cans into the boxes",
+        "Close the opened drawer",
+        "Open the closed drawer",
+        EGO_VLA_REAL_WRIST_PROMPT,
+        "Flip the mug",
+        "unload the right cans and then unload the left cans",
+        "put can on the saucer",
+        "Open the drawer, and Put can on the saucer",
+        "open the laptop",
+    }
+)
 
 
 def _validate_robot_action_dim_info(
@@ -138,7 +164,10 @@ def _is_hf_repo_id(value: str) -> bool:
 
 def _resolve_cosmos_model(model_cfg: dict[str, Any]) -> str:
     """Return HuggingFace repo id or a local path for Cosmos (processor backbone)."""
-    raw_path = model_cfg.get("cosmos_model_path")
+    raw_path = (
+        os.environ.get("GR00T_COSMOS_MODEL", "").strip()
+        or model_cfg.get("cosmos_model_path")
+    )
     if raw_path is None or raw_path == "":
         return DEFAULT_COSMOS_MODEL_REPO
 
@@ -189,6 +218,71 @@ def _override_processor_cosmos_model(checkpoint_dir: Path, cosmos_model: str) ->
             json.dump(data, f, indent=2)
 
 
+def _device_is_cpu(device: Any) -> bool:
+    """Return whether a model device denotes CPU execution."""
+    return str(device).strip().lower().split(":", 1)[0] == "cpu"
+
+
+@contextmanager
+def _cpu_checkpoint_view(checkpoint_dir: Path, device: Any) -> Iterator[Path]:
+    """Provide a copy-on-write checkpoint view for CPU debug/eval.
+
+    GR00T-N1.7 checkpoints are trained with FlashAttention2 enabled.  The
+    upstream loader reads that setting from ``config.json`` and fails before
+    model construction on a CPU-only debug worker.  A temporary directory
+    containing symlinks to the (large) weight files lets us switch attention to
+    SDPA without mutating the real checkpoint or duplicating tens of GB.
+    GPU evaluation keeps the original checkpoint path byte-for-byte intact.
+    """
+    if not _device_is_cpu(device):
+        yield checkpoint_dir
+        return
+
+    config_path = checkpoint_dir / "config.json"
+    try:
+        with open(config_path, encoding="utf-8") as file:
+            config = json.load(file)
+    except (OSError, json.JSONDecodeError):
+        # Let the normal loader report a more specific checkpoint error.
+        yield checkpoint_dir
+        return
+
+    if not config.get("use_flash_attention") and config.get("attn_implementation") != "flash_attention_2":
+        yield checkpoint_dir
+        return
+
+    with tempfile.TemporaryDirectory(prefix="gr00t_cpu_checkpoint_") as raw_view:
+        view = Path(raw_view)
+        for entry in checkpoint_dir.iterdir():
+            destination = view / entry.name
+            if entry.name == "config.json":
+                cpu_config = dict(config)
+                cpu_config["use_flash_attention"] = False
+                if cpu_config.get("attn_implementation") == "flash_attention_2":
+                    cpu_config["attn_implementation"] = "sdpa"
+                destination.write_text(
+                    json.dumps(cpu_config, indent=2),
+                    encoding="utf-8",
+                )
+            elif entry.name == "processor_config.json":
+                # This file is also overridden for the local Cosmos path; copy
+                # it so that nested context managers never edit the source.
+                shutil.copy2(entry, destination)
+            else:
+                destination.symlink_to(entry, target_is_directory=entry.is_dir())
+        yield view
+
+
+def _is_loadable_checkpoint_dir(path: Path) -> bool:
+    """Return whether path is already a complete HF-style step directory."""
+
+    if not path.is_dir() or not (path / "config.json").is_file():
+        return False
+    return (path / "model.safetensors").is_file() or (
+        path / "model.safetensors.index.json"
+    ).is_file()
+
+
 def _resolve_checkpoint_dir(model_cfg: dict[str, Any]) -> Path:
     # Shared precedence: model_dir key > ckpt_name-as-path >
     # {bench}-{ckpt}-{env}-{action}-{seed} concat > checkpoints/<ckpt_name>.
@@ -200,6 +294,10 @@ def _resolve_checkpoint_dir(model_cfg: dict[str, Any]) -> Path:
     )
     if not root.is_dir():
         raise FileNotFoundError(f"Checkpoint root not found: {root}")
+    # Web and the native CLI pass an absolute checkpoint-<step> path so the
+    # selected epoch remains exact even when newer checkpoints appear later.
+    if _is_loadable_checkpoint_dir(root):
+        return root.resolve()
 
     search_roots = [root]
     for child in sorted(root.iterdir()):
@@ -262,7 +360,7 @@ def _ensure_hwc_uint8(image: Any) -> np.ndarray:
     raise ValueError(f"Unsupported image shape: {image.shape}")
 
 
-def _extract_image(observation: dict[str, Any], candidate_names: list[str]) -> np.ndarray:
+def _extract_image_value(observation: dict[str, Any], candidate_names: list[str]) -> Any:
     vision = observation.get("vision", {})
     for candidate_name in candidate_names:
         if candidate_name not in vision:
@@ -271,15 +369,30 @@ def _extract_image(observation: dict[str, Any], candidate_names: list[str]) -> n
         if isinstance(image, dict):
             for image_key in ("color", "colors", "rgb"):
                 if image_key in image:
-                    return _ensure_hwc_uint8(image[image_key])
+                    return image[image_key]
         else:
-            return _ensure_hwc_uint8(image)
+            return image
     raise KeyError(f"Could not find any image for candidates: {candidate_names}")
+
+
+def _extract_image(observation: dict[str, Any], candidate_names: list[str]) -> np.ndarray:
+    return _ensure_hwc_uint8(_extract_image_value(observation, candidate_names))
 
 
 def _to_rgb_hwc(image: np.ndarray) -> np.ndarray:
     """XPolicyLab obs images are RGB; match LeRobot video training."""
     return _ensure_hwc_uint8(image)
+
+
+def _require_egovla_rgb(image: Any, camera_name: str) -> np.ndarray:
+    """Enforce the decoded EgoVLA runtime boundary: HWC uint8 RGB 384x384."""
+    array = np.asarray(image)
+    if array.dtype != np.uint8 or array.shape != EGO_VLA_RAW_IMAGE_SHAPE:
+        raise ValueError(
+            f"EgoVLA {camera_name} must be RGB uint8 {EGO_VLA_RAW_IMAGE_SHAPE}, "
+            f"got shape={array.shape}, dtype={array.dtype}"
+        )
+    return np.ascontiguousarray(array)
 
 
 def _as_1d(value: Any, length: int) -> np.ndarray:
@@ -306,14 +419,14 @@ def _extract_prompt(observation: dict[str, Any], default_prompt: str) -> str:
                             marker = "Generate robot actions for the task:\n"
                             if marker in text:
                                 text = text.split(marker, 1)[1]
-                            return text.replace(" /no_cot", "").strip()
+                            return text.replace(" /no_cot", "")
         if isinstance(value, list):
             if not value:
                 continue
             value = value[0]
-        if isinstance(value, str) and value.strip():
-            return value.strip()
-    return default_prompt
+        if isinstance(value, str) and value:
+            return value
+    return str(default_prompt)
 
 
 def _physical_group_dims(robot_action_dim_info: dict[str, Any]) -> list[tuple[str, int]]:
@@ -399,12 +512,42 @@ def _encode_observation(
     default_prompt: str,
     action_type: str,
     robot_action_dim_info: dict[str, Any],
+    env_cfg_type: str = "",
 ) -> dict[str, Any]:
-    images = {
-        video_key: _to_rgb_hwc(_extract_image(obs, candidates))
-        for video_key, candidates in VIDEO_KEY_CANDIDATES.items()
-    }
     prompt = _extract_prompt(obs, default_prompt)
+    if env_cfg_type == "ego_h1_inspire":
+        if prompt not in EGO_VLA_TASK_PROMPTS:
+            raise ValueError(
+                "EgoVLA inference requires an exact benchmark-registry instruction; "
+                f"got {prompt!r}"
+            )
+        front = _require_egovla_rgb(
+            _extract_image_value(obs, VIDEO_KEY_CANDIDATES["front"]), "front"
+        )
+        if prompt == EGO_VLA_REAL_WRIST_PROMPT:
+            left_wrist = _require_egovla_rgb(
+                _extract_image_value(obs, VIDEO_KEY_CANDIDATES["left_wrist"]),
+                "left_wrist",
+            )
+            right_wrist = _require_egovla_rgb(
+                _extract_image_value(obs, VIDEO_KEY_CANDIDATES["right_wrist"]),
+                "right_wrist",
+            )
+        else:
+            # These 11 benchmark tasks are head-only in training.  Ignore any
+            # simulator wrist payload and reproduce the exact black-view contract.
+            left_wrist = np.zeros(EGO_VLA_RAW_IMAGE_SHAPE, dtype=np.uint8)
+            right_wrist = np.zeros(EGO_VLA_RAW_IMAGE_SHAPE, dtype=np.uint8)
+        images = {
+            "front": front,
+            "left_wrist": left_wrist,
+            "right_wrist": right_wrist,
+        }
+    else:
+        images = {
+            video_key: _to_rgb_hwc(_extract_image(obs, candidates))
+            for video_key, candidates in VIDEO_KEY_CANDIDATES.items()
+        }
     state_groups = _pack_state_groups(obs, action_type, robot_action_dim_info)
 
     return {
@@ -485,13 +628,14 @@ class Model(ModelTemplate):
         embodiment_tag = model_cfg.get("embodiment_tag", "NEW_EMBODIMENT")
         cosmos_model = _resolve_cosmos_model(model_cfg)
 
-        with _override_processor_cosmos_model(checkpoint_dir, cosmos_model):
-            self.policy = Gr00tPolicy(
-                model_path=str(checkpoint_dir),
-                embodiment_tag=embodiment_tag,
-                device=self.device,
-                strict=True,
-            )
+        with network_checkpoint_view(checkpoint_dir) as network_dir, _cpu_checkpoint_view(network_dir, self.device) as load_dir:
+            with _override_processor_cosmos_model(load_dir, cosmos_model):
+                self.policy = Gr00tPolicy(
+                    model_path=str(load_dir),
+                    embodiment_tag=embodiment_tag,
+                    device=self.device,
+                    strict=True,
+                )
         self.model = self.policy
         expected_groups = [name for name, _ in _gr00t_group_dims(self.robot_action_dim_info)]
         for modality in ("state", "action"):
@@ -534,6 +678,7 @@ class Model(ModelTemplate):
                 self.default_prompt,
                 self.action_type,
                 self.robot_action_dim_info,
+                self.env_cfg_type,
             )
             for obs in obs_list
         ]

@@ -12,7 +12,9 @@ class TestEnv:
         self.success_num, self.episode_num = 0, 0
         self._stop_check = None
         self.deploy_cfg = deploy_cfg
-        self.episode_step_limit = 20
+        self.episode_step_limit = int(deploy_cfg.get("episode_step_limit", 20))
+        if self.episode_step_limit <= 0:
+            raise ValueError("episode_step_limit must be positive")
         self.obs_encoded = deploy_cfg.get('obs_encoded', False)
         env_cfg_type = deploy_cfg['env_cfg_type']
         self.robot_action_dim_info = get_robot_action_dim_info(env_cfg_type)
@@ -330,6 +332,12 @@ if __name__ == "__main__":
     parser.add_argument("--trial_id", type=str, default="debug-trial")
     parser.add_argument("--repeat_index", type=int)
     parser.add_argument("--eval_episode_num", type=int, default=10, help="number of evaluation episodes")
+    parser.add_argument(
+        "--episode_step_limit",
+        type=int,
+        default=int(os.environ.get("DEBUG_EPISODE_STEPS", "20")),
+        help="maximum actions per debug episode (default: 20)",
+    )
     parser.add_argument("--eval_batch", type=str2bool, default=False, help="whether to run batch evaluation")
     parser.add_argument("--obs_encoded", type=str2bool, default=os.environ.get("DEBUG_OBS_ENCODED", "0"),
                         help="send encoded camera colors to exercise the server-side decode path")

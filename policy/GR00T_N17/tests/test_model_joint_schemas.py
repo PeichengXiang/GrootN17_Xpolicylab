@@ -7,8 +7,11 @@ from unittest.mock import patch
 import numpy as np
 
 from policy.GR00T_N17.model import (
+    EGO_VLA_REAL_WRIST_PROMPT,
+    _encode_observation,
     _gr00t_action_to_env,
     _gr00t_group_dims,
+    _extract_prompt,
     _pack_state_groups,
     _resolve_robot_action_dim_info,
 )
@@ -31,6 +34,83 @@ def _state(
 
 
 class JointSchemaTest(unittest.TestCase):
+    def test_benchmark_instruction_is_preserved_exactly(self) -> None:
+        prompt = _extract_prompt(
+            {
+                "instruction": (
+                    "Insert the left can into the slot and insert the right can into the slot, "
+                    "unload the left cans andd then unload the right cans"
+                )
+            },
+            "fallback",
+        )
+        self.assertEqual(prompt, EGO_VLA_REAL_WRIST_PROMPT)
+
+    @staticmethod
+    def _egovla_observation(prompt: str, shape=(384, 384, 3)) -> dict:
+        head = np.full(shape, 17, dtype=np.uint8)
+        left = np.full(shape, 31, dtype=np.uint8)
+        right = np.full(shape, 47, dtype=np.uint8)
+        observation = _state(
+            np.zeros(7, dtype=np.float32),
+            np.zeros(12, dtype=np.float32),
+            np.zeros(7, dtype=np.float32),
+            np.zeros(12, dtype=np.float32),
+        )
+        observation.update(
+            {
+                "instruction": prompt,
+                "vision": {
+                    "cam_head": {"color": head},
+                    "cam_left_wrist": {"color": left},
+                    "cam_right_wrist": {"color": right},
+                },
+            }
+        )
+        return observation
+
+    def test_head_only_egovla_task_forces_black_wrists(self) -> None:
+        encoded = _encode_observation(
+            self._egovla_observation("Close the opened drawer"),
+            "unused",
+            "joint",
+            {"arm_dim": [7, 7], "ee_dim": [12, 12]},
+            "ego_h1_inspire",
+        )
+        self.assertTrue(np.all(encoded["video"]["left_wrist"] == 0))
+        self.assertTrue(np.all(encoded["video"]["right_wrist"] == 0))
+        self.assertTrue(np.all(encoded["video"]["front"] == 17))
+
+    def test_three_view_egovla_task_preserves_real_wrists(self) -> None:
+        encoded = _encode_observation(
+            self._egovla_observation(EGO_VLA_REAL_WRIST_PROMPT),
+            "unused",
+            "joint",
+            {"arm_dim": [7, 7], "ee_dim": [12, 12]},
+            "ego_h1_inspire",
+        )
+        self.assertTrue(np.all(encoded["video"]["left_wrist"] == 31))
+        self.assertTrue(np.all(encoded["video"]["right_wrist"] == 47))
+
+    def test_egovla_camera_and_prompt_contract_fail_closed(self) -> None:
+        metadata = {"arm_dim": [7, 7], "ee_dim": [12, 12]}
+        with self.assertRaisesRegex(ValueError, "exact benchmark-registry instruction"):
+            _encode_observation(
+                self._egovla_observation("Perform the task"),
+                "unused",
+                "joint",
+                metadata,
+                "ego_h1_inspire",
+            )
+        with self.assertRaisesRegex(ValueError, "RGB uint8"):
+            _encode_observation(
+                self._egovla_observation("Close the opened drawer", shape=(256, 256, 3)),
+                "unused",
+                "joint",
+                metadata,
+                "ego_h1_inspire",
+            )
+
     def test_arx_metadata_resolver_regression(self) -> None:
         metadata = _resolve_robot_action_dim_info("arx_x5")
         self.assertEqual(metadata["arm_dim"], [6, 6])

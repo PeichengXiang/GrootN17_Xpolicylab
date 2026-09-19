@@ -10,6 +10,17 @@ runs/
 Log/
 logs/
 
+# Local GR00T / EgoVLA run artifacts
+**/checkpoints_*/
+**/.codex-backups/
+**/.eval-adapt-backup-*/
+*.log
+*.pid
+*.orig
+*.bak-*
+groot_corrected_run_*.json
+**/wandb/
+
 # H_RDT local artifacts and large model assets
 policy/H_RDT/.cache/
 policy/H_RDT/H_RDT/.cache/

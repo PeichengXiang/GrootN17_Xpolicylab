@@ -20,7 +20,16 @@ protocol_override="${14:-}"
 source "${UTILS_DIR}/resolve_eval_env_type.sh"
 eval_env_mode="$(resolve_eval_env_type)" || exit 1
 
-read eval_batch yaml_protocol < <(python - <<PY
+YAML_PYTHON="${PYTHON_BIN:-}"
+if [[ -z "${YAML_PYTHON}" || ! -x "${YAML_PYTHON}" ]]; then
+    YAML_PYTHON="$(command -v python3 || command -v python || true)"
+fi
+if [[ -z "${YAML_PYTHON}" ]]; then
+    echo "[CLIENT][ERROR] Cannot find Python 3 to parse ${yaml_file}" >&2
+    exit 1
+fi
+
+read eval_batch yaml_protocol < <("${YAML_PYTHON}" - <<PY
 import yaml
 with open("${yaml_file}", "r") as f:
     data = yaml.safe_load(f)

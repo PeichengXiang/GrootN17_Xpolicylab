@@ -490,17 +490,35 @@ class PolicyEvalClient:
         # is a caller error and must surface directly, not masquerade as a
         # connection failure and trigger a pointless reconnect + retry.
         data = encode_frame(frame)
+        timeout = timeout_s if timeout_s is not None else self.config.request_timeout_s
         if expected is None:
-            await self._ws.send(data)
+            try:
+                await asyncio.wait_for(self._ws.send(data), timeout=timeout)
+            except asyncio.TimeoutError as exc:
+                raise WsError(ErrorCode.TIMEOUT, f"timeout sending {msg_type.value}") from exc
             return frame
 
         loop = asyncio.get_running_loop()
+        deadline = loop.time() + timeout
         fut: asyncio.Future[Frame] = loop.create_future()
         self._pending[request_id] = fut
         try:
-            await self._ws.send(data)
+            # A peer that stops reading can block send() before response
+            # waiting begins. Both phases share the configured wire budget.
+            await asyncio.wait_for(self._ws.send(data), timeout=timeout)
+        except asyncio.TimeoutError as exc:
+            self._pending.pop(request_id, None)
+            fut.cancel()
+            # Delivery may be partial or complete. A timeout is fatal for
+            # this trial, just like a response timeout; don't execute it again.
+            raise WsError(ErrorCode.TIMEOUT, f"timeout sending {msg_type.value}") from exc
+        except asyncio.CancelledError:
+            self._pending.pop(request_id, None)
+            fut.cancel()
+            raise
         except Exception:
             self._pending.pop(request_id, None)
+            fut.cancel()
             if not _reconnect_attempted and not self._closed and msg_type != MessageType.HELLO:
                 _status("RECONNECT", _YELLOW, f"send failed for {msg_type.value}; reconnecting to {self.config.url}")
                 await self._reset_connection_state()
@@ -517,9 +535,8 @@ class PolicyEvalClient:
                     _request_id=request_id,
                 )
             raise
-        timeout = timeout_s if timeout_s is not None else self.config.request_timeout_s
         try:
-            response = await asyncio.wait_for(fut, timeout=timeout)
+            response = await asyncio.wait_for(fut, timeout=max(0.0, deadline - loop.time()))
         except asyncio.TimeoutError as exc:
             self._pending.pop(request_id, None)
             # The server may STILL be executing this request. Dedup only

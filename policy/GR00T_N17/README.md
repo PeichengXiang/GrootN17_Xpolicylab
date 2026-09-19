@@ -109,6 +109,42 @@ bash eval.sh RoboDojo stack_bowls RoboDojo-cotrain-arx_x5-joint-0 arx_x5 joint 0
 
 `EVAL_ENV_TYPE=debug` runs the offline wiring check (no simulator); leave it unset or set `EVAL_ENV_TYPE=sim` for RoboDojo simulation. For split-machine deployment via `setup_eval_policy_server.sh` / `setup_eval_env_client.sh`, follow the [Deployment Flow](../../README.md#-deployment-flow).
 
+### EgoVLA H1-Inspire evaluation
+
+This checkout also contains the 38-D EgoVLA adapter used with the external
+EgoVLA benchmark workspace. The benchmark still receives one absolute 50-D H1
+target; its integration layer scatters the policy's `left_arm(7),
+left_hand(12), right_arm(7), right_hand(12)` fields into that native target.
+Use the adapted checkout as the policy root and set the benchmark root
+explicitly (the scripts also consume `EGOVLA_WORKSPACE_ROOT` when launched by
+the bridge):
+
+```bash
+MODEL_ROOT=/personal/xiangpc/0811_Xpolicylab_bench/GrootN17
+EGO_ROOT="/personal/xiangpc/EgoVLA benchmark"
+CHECKPOINT="$MODEL_ROOT/policy/GR00T_N17/checkpoints/EgoVLA-all_tasks-ego_h1_inspire-joint-38d-seed0/checkpoint-20000"
+
+# Offline adapter/transport smoke; DEBUG_OBS_ENCODED also tests server-side
+# image decoding. It does not launch Isaac Sim.
+EVAL_MAIN_ROOT="$EGO_ROOT" EVAL_ENV_TYPE=debug DEBUG_OBS_ENCODED=1 \
+  bash "$MODEL_ROOT/policy/GR00T_N17/eval.sh" \
+  EgoVLA Humanoid-Push-Box-v0 "$CHECKPOINT" ego_h1_inspire joint 0 \
+  0 1 "$MODEL_ROOT/policy/GR00T_N17/gr00t_n17" \
+  "$EGO_ROOT/.runtime/conda/egovla-isaaclab-1.2.0"
+
+# Real simulator rollout (after reviewing the NVIDIA EULA): export
+# ACCEPT_EULA=Y, remove EVAL_ENV_TYPE=debug, and choose the requested task.
+```
+
+The policy environment argument may be the GR00T project root, its `.venv`
+prefix, or a conda environment. Checkpoints are resolved from an explicit
+`checkpoint-*` directory, `model_dir`, or the conventional run directory; the
+adapter verifies the 38-D modality groups before serving actions. The current
+EgoVLA bridge requires `env_cfg_type=ego_h1_inspire` and `action_type=joint`.
+The adapter canonicalizes the released benchmark's historical `andd then`
+instruction typo to the `and then` wording used in the audited training
+metadata.
+
 ## Configuration
 
 `deploy.yml` keys to check before evaluation: `embodiment_tag`, `checkpoint_num`, `model_dir` (optional checkpoint directory relative to `policy/GR00T_N17/`; when set, it bypasses `checkpoints/<ckpt_name>`), `cosmos_model_path` (Hugging Face repo id, or local Cosmos directory relative to `policy/GR00T_N17/`), `default_prompt`, `policy_uv_env_path`.

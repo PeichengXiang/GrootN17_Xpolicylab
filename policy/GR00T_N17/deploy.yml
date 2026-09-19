@@ -6,7 +6,9 @@ bench_name: null
 task_name: null
 env_cfg_type: null
 seed: null
-eval_batch: false
+# Official EgoVLA evaluation is single-environment; the adapter still keeps
+# get_action_batch available for debug/legacy callers.
+eval_batch: true
 
 # Model / checkpoint configuration (local paths relative to policy/GR00T_N17/)
 action_type: joint
@@ -15,7 +17,7 @@ embodiment_tag: NEW_EMBODIMENT
 checkpoint_num: last
 model_dir: null
 # Cosmos backbone for processor; HuggingFace repo id (auto-download) or relative local path
-cosmos_model_path: shared/Cosmos-Reason2-2B
+cosmos_model_path: /personal/xspark_shared/model_weights/Cosmos-Reason2-2B
 default_prompt: Perform the robot manipulation task.
 
 # Debug blocker (192.168.156.48): gr00t_n17/.venv not installed; run install.sh first.
@@ -23,3 +25,11 @@ default_prompt: Perform the robot manipulation task.
 policy_uv_env_path: gr00t_n17
 
 port: 6000
+
+# GR00T inference can spend more than the legacy 120s request budget while a
+# checkpoint/processor is first loaded.  These values only affect the client
+# handshake/RPC and do not change simulator timing.
+request_timeout_s: 300
+connect_timeout_s: 30
+handshake_timeout_s: 30
+max_connect_seconds: 1200
