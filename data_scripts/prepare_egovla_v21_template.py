@@ -83,7 +83,7 @@ def probe_video(job: tuple[Path, str, int, bool]) -> dict[str, Any]:
             "-select_streams",
             "v:0",
             "-show_entries",
-            "stream=width,height,r_frame_rate,nb_read_frames",
+            "stream=width,height,r_frame_rate,avg_frame_rate,start_time,duration,nb_read_frames",
             "-of",
             "json",
             str(path),
@@ -98,16 +98,24 @@ def probe_video(job: tuple[Path, str, int, bool]) -> dict[str, Any]:
         raise ValueError(f"{path}: expected one video stream, got {len(streams)}")
     stream = streams[0]
     actual_frames = int(stream.get("nb_read_frames", -1))
+    expected_duration = expected_frames / 30
+    actual_start = float(stream.get("start_time", "nan"))
+    actual_duration = float(stream.get("duration", "nan"))
     if (
         actual_frames != expected_frames
         or int(stream.get("width", -1)) != 384
         or int(stream.get("height", -1)) != 384
         or stream.get("r_frame_rate") != "30/1"
+        or stream.get("avg_frame_rate") != "30/1"
+        or abs(actual_start) > 1e-6
+        or abs(actual_duration - expected_duration) > 1e-4
     ):
         raise ValueError(
             f"{path}: frames/shape/fps={actual_frames}/"
             f"{stream.get('height')}x{stream.get('width')}/"
-            f"{stream.get('r_frame_rate')}, expected={expected_frames}/384x384/30"
+            f"{stream.get('r_frame_rate')}/{stream.get('avg_frame_rate')}, "
+            f"start/duration={actual_start}/{actual_duration}, "
+            f"expected={expected_frames}/384x384/30/30/0/{expected_duration}"
         )
     black_max = None
     black_frames = 0

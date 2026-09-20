@@ -336,8 +336,6 @@ def _extract_video_segment(
         f"{start:.6f}",
         "-i",
         str(src),
-        "-t",
-        f"{duration:.6f}",
         "-map",
         "0:v:0",
         "-frames:v",
@@ -346,7 +344,7 @@ def _extract_video_segment(
         "copy",
         "-an",
         "-avoid_negative_ts",
-        "1",
+        "auto",
         "-y",
         str(dst),
     ]
