@@ -31,6 +31,7 @@ import subprocess
 import sys
 from typing import Any
 
+
 try:
     import h5py
     import numpy as np
@@ -45,12 +46,12 @@ except ModuleNotFoundError as exc:  # pragma: no cover - environment hint
 SCRIPT_DIR = Path(__file__).resolve().parent
 MODEL_ROOT = SCRIPT_DIR.parent
 DEFAULT_RAW = Path("/personal/xiangpc/EgoVLA benchmark/data/EgoVLA/raw_remove_deprecated")
-DEFAULT_CACHE = Path(
-    "/personal/xiangpc/0811_Xpolicylab_bench/RLDX_1/data/EgoVLA_benchmark_rldx_v21"
-)
+DEFAULT_CACHE = MODEL_ROOT / "data" / "EgoVLA_benchmark_template_v21"
 DEFAULT_OUTPUT = MODEL_ROOT / "data" / "EgoVLA_benchmark_raw_action_v21"
 DEFAULT_GR00T_ROOT = MODEL_ROOT / "policy" / "GR00T_N17" / "gr00t_n17"
-DEFAULT_MODALITY_CONFIG = MODEL_ROOT / "policy" / "GR00T_N17" / "configs" / "ego_h1_inspire_config.py"
+DEFAULT_MODALITY_CONFIG = (
+    MODEL_ROOT / "policy" / "GR00T_N17" / "configs" / "ego_h1_inspire_config.py"
+)
 
 FPS = 30
 IMAGE_SHAPE = (384, 384, 3)
@@ -60,6 +61,7 @@ EXPECTED_DEPRECATED = 0
 RAW_MANIFEST_SHA256 = "f3bfceb6fafd6f28b3d93d3f5048f20aae62871b34eff372b8e320aeda9d172c"
 RAW_INVENTORY_SHA256 = "dc8265b266a9ebb0d3ad8264c1c7a810207cf5aa04b2ddca011d8470c1fa14df"
 RAW_TOTAL_BYTES = 505_962_797_780
+MODALITY_CONFIG_SHA256 = "fcdadfac0d6a94aacdd33ae07f5b87ef18e01b55926c50f3a42980ff454b2f86"
 
 TASK_INSTRUCTIONS: dict[str, str] = {
     "Pour-Balls": "pour balls in cup into bowl",
@@ -219,7 +221,9 @@ def _check_raw_episode(path: Path) -> tuple[int, bool]:
         for key in ("observations/qpos", "action"):
             ds = h5[key]
             if ds.shape != (frames, RAW_DIM) or ds.dtype.kind not in "fiu":
-                raise ValueError(f"{path}: /{key} must be (T,50) numeric, got {ds.shape}/{ds.dtype}")
+                raise ValueError(
+                    f"{path}: /{key} must be (T,50) numeric, got {ds.shape}/{ds.dtype}"
+                )
             # Check endpoints without loading the 50-D trajectory into memory.
             for index in (0, frames - 1):
                 if not np.isfinite(ds[index]).all():
@@ -274,7 +278,9 @@ def audit_raw(source: Path) -> dict[str, Any]:
         task_root = source / task
         if not task_root.is_dir():
             raise FileNotFoundError(f"missing task directory: {task_root}")
-        candidates = sorted(task_root.rglob("episode_*.hdf5"), key=lambda p: _natural_key(p, task_root))
+        candidates = sorted(
+            task_root.rglob("episode_*.hdf5"), key=lambda p: _natural_key(p, task_root)
+        )
         for path in candidates:
             if _is_deprecated(path, task_root):
                 deprecated.append(path.relative_to(source).as_posix())
@@ -297,7 +303,11 @@ def audit_raw(source: Path) -> dict[str, Any]:
 
     unknown_top_dirs = []
     for child in source.iterdir():
-        if child.is_dir() and not child.name.startswith(".") and child.name not in TASK_INSTRUCTIONS:
+        if (
+            child.is_dir()
+            and not child.name.startswith(".")
+            and child.name not in TASK_INSTRUCTIONS
+        ):
             unknown_top_dirs.append(child.name)
     if unknown_top_dirs:
         raise ValueError(f"unexpected top-level raw task directories: {unknown_top_dirs}")
@@ -332,7 +342,9 @@ def audit_raw(source: Path) -> dict[str, Any]:
             )
         actual_total_bytes += actual_size
     if actual_total_bytes != RAW_TOTAL_BYTES:
-        raise ValueError(f"raw active byte total mismatch: {actual_total_bytes} != {RAW_TOTAL_BYTES}")
+        raise ValueError(
+            f"raw active byte total mismatch: {actual_total_bytes} != {RAW_TOTAL_BYTES}"
+        )
 
     return {
         "source_root": str(source),
@@ -371,7 +383,9 @@ def validate_cache(cache: Path, raw_audit: dict[str, Any]) -> dict[str, Any]:
     expected = raw_audit["total_episodes"], raw_audit["total_frames"]
     actual = info.get("total_episodes"), info.get("total_frames")
     if info.get("codebase_version") != "v2.1" or actual != expected or info.get("fps") != FPS:
-        raise ValueError(f"cache info mismatch: version/totals/fps={info.get('codebase_version')}/{actual}/{info.get('fps')}")
+        raise ValueError(
+            f"cache info mismatch: version/totals/fps={info.get('codebase_version')}/{actual}/{info.get('fps')}"
+        )
     features = info.get("features", {})
     for key in ("observation.state", "action"):
         if features.get(key, {}).get("shape") != [POLICY_DIM]:
@@ -382,6 +396,7 @@ def validate_cache(cache: Path, raw_audit: dict[str, Any]) -> dict[str, Any]:
         "meta/modality.json",
         "meta/stats.json",
         "meta/relative_stats.json",
+        "meta/egovla_v21_video_audit.json",
     ):
         if not (cache / required).is_file():
             raise FileNotFoundError(f"cache missing {required}")
@@ -541,8 +556,12 @@ def _rewrite_prompt_metadata(staging: Path) -> None:
         if row.get("task") == corrected:
             row["task"] = canonical
             replacements += 1
-    if replacements != 1:
-        raise ValueError(f"expected one corrected prompt in tasks.jsonl, found {replacements}")
+    canonical_rows = sum(row.get("task") == canonical for row in task_rows)
+    if replacements not in (0, 1) or canonical_rows != 1:
+        raise ValueError(
+            "expected exactly one canonical long prompt after rewrite; "
+            f"corrected_replacements={replacements}, canonical_rows={canonical_rows}"
+        )
     _write_jsonl(tasks_path, task_rows)
 
     episodes_path = staging / "meta" / "episodes.jsonl"
@@ -553,10 +572,16 @@ def _rewrite_prompt_metadata(staging: Path) -> None:
         rewritten = [canonical if task == corrected else task for task in row_tasks]
         episode_replacements += sum(task == corrected for task in row_tasks)
         row["tasks"] = rewritten
-    if episode_replacements != EXPECTED_TASK_EPISODES["Insert-And-Unload-Cans"]:
+    canonical_episodes = sum(row.get("tasks", []).count(canonical) for row in episode_rows)
+    expected_episodes = EXPECTED_TASK_EPISODES["Insert-And-Unload-Cans"]
+    if (
+        episode_replacements not in (0, expected_episodes)
+        or canonical_episodes != expected_episodes
+    ):
         raise ValueError(
-            "unexpected Insert-And-Unload-Cans episode prompt count: "
-            f"{episode_replacements}"
+            "unexpected Insert-And-Unload-Cans episode prompt rewrite: "
+            f"corrected_replacements={episode_replacements}, "
+            f"canonical_episodes={canonical_episodes}"
         )
     _write_jsonl(episodes_path, episode_rows)
 
@@ -566,7 +591,9 @@ def _column_matrix(table: pa.Table, name: str) -> np.ndarray:
         raise KeyError(f"parquet is missing required column {name!r}")
     values = np.asarray(table[name].to_pylist(), dtype=np.float32)
     if values.ndim != 2 or values.shape[1] != POLICY_DIM:
-        raise ValueError(f"parquet column {name!r} must have shape [T,{POLICY_DIM}], got {values.shape}")
+        raise ValueError(
+            f"parquet column {name!r} must have shape [T,{POLICY_DIM}], got {values.shape}"
+        )
     return values
 
 
@@ -632,7 +659,9 @@ def _rewrite_actions(
         if not np.array_equal(parquet_state, raw_state):
             raise ValueError(f"template state is not same-timestep raw qpos for {raw_path}")
         if not np.array_equal(provenance_action, raw_action):
-            raise ValueError(f"template raw-action provenance differs from HDF5 /action for {raw_path}")
+            raise ValueError(
+                f"template raw-action provenance differs from HDF5 /action for {raw_path}"
+            )
 
         next_state = np.concatenate((raw_state[1:], raw_state[-1:]), axis=0)
         old_next_state_episodes += int(np.array_equal(previous_training_action, next_state))
@@ -643,7 +672,9 @@ def _rewrite_actions(
 
         action_field = table.schema.field("action")
         action_column = pa.array(raw_action.tolist(), type=action_field.type)
-        rewritten = table.set_column(table.schema.get_field_index("action"), action_field, action_column)
+        rewritten = table.set_column(
+            table.schema.get_field_index("action"), action_field, action_column
+        )
         metadata = pq.read_metadata(source_parquet)
         compression = metadata.row_group(0).column(0).compression.lower()
         if compression == "uncompressed":
@@ -718,6 +749,8 @@ def validate_output(output: Path, raw_audit: dict[str, Any]) -> dict[str, Any]:
     if not manifest_path.is_file():
         raise FileNotFoundError("converted dataset is missing egovla_groot_conversion.json")
     manifest = _read_json(manifest_path)
+    if manifest.get("modality_config_sha256") != MODALITY_CONFIG_SHA256:
+        raise ValueError("converted dataset used an unexpected EgoVLA modality config")
     action_audit = manifest.get("raw_action_rewrite", {})
     if action_audit.get("next_observed_state_used_as_action") is not False:
         raise ValueError("converted dataset does not explicitly forbid next-state action labels")
@@ -734,7 +767,14 @@ def validate_output(output: Path, raw_audit: dict[str, Any]) -> dict[str, Any]:
     if [row.get("task") for row in task_rows] != list(TASK_INSTRUCTIONS.values()):
         raise ValueError("published task prompts do not exactly match the benchmark registry")
     expected_hashes = manifest.get("dataset_meta_sha256", {})
-    for name in ("info.json", "modality.json", "tasks.jsonl", "stats.json", "relative_stats.json"):
+    for name in (
+        "info.json",
+        "modality.json",
+        "tasks.jsonl",
+        "stats.json",
+        "relative_stats.json",
+        "egovla_v21_video_audit.json",
+    ):
         actual = _sha256(output / "meta" / name)
         if expected_hashes.get(name) != actual:
             raise ValueError(f"converted dataset metadata hash mismatch for {name}")
@@ -846,6 +886,7 @@ def materialize(
             },
             "statistics_generator": str(gr00t_root / "gr00t" / "data" / "stats.py"),
             "modality_config": str(modality_config),
+            "modality_config_sha256": _sha256(modality_config),
             "dataset_meta_sha256": {
                 name: _sha256(staging / "meta" / name)
                 for name in (
@@ -855,6 +896,7 @@ def materialize(
                     "stats.json",
                     "relative_stats.json",
                     "xpolicylab_source_conversion.json",
+                    "egovla_v21_video_audit.json",
                 )
             },
         }
@@ -879,8 +921,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--gr00t-root", type=Path, default=DEFAULT_GR00T_ROOT)
     parser.add_argument("--modality-config", type=Path, default=DEFAULT_MODALITY_CONFIG)
-    parser.add_argument("--dry-run", action="store_true", help="audit only; do not materialize data")
-    parser.add_argument("--force", action="store_true", help="backup and replace the exact output path")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="audit only; do not materialize data"
+    )
+    parser.add_argument(
+        "--force", action="store_true", help="backup and replace the exact output path"
+    )
     return parser.parse_args()
 
 

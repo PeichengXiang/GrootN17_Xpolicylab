@@ -70,6 +70,20 @@ class CheckpointFormatCallback(TrainerCallback):
                 print(f"Copying wandb_config.json from {wandb_config_src} to {wandb_config_dst}")
                 shutil.copy2(wandb_config_src, wandb_config_dst)
 
+            # XPolicyLab/EgoVLA writes these audited sidecars before training.
+            # Keep them in every standalone checkpoint so inference can reject
+            # checkpoints trained with next-state labels or incompatible camera
+            # and prompt contracts even after a checkpoint is moved elsewhere.
+            for sidecar_name in (
+                "egovla_training_contract.json",
+                "egovla_observation.json",
+            ):
+                sidecar_src = Path(args.output_dir) / sidecar_name
+                if sidecar_src.exists():
+                    sidecar_dst = checkpoint_dir / sidecar_name
+                    print(f"Copying {sidecar_name} from {sidecar_src} to {sidecar_dst}")
+                    shutil.copy2(sidecar_src, sidecar_dst)
+
 
 class BestMetricCheckpointCallback(TrainerCallback):
     """This callback saves the best checkpoint based on the metric."""

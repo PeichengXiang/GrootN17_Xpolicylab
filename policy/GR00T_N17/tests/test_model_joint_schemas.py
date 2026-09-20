@@ -5,13 +5,12 @@ import unittest
 from unittest.mock import patch
 
 import numpy as np
-
 from policy.GR00T_N17.model import (
     EGO_VLA_REAL_WRIST_PROMPT,
     _encode_observation,
+    _extract_prompt,
     _gr00t_action_to_env,
     _gr00t_group_dims,
-    _extract_prompt,
     _pack_state_groups,
     _resolve_robot_action_dim_info,
 )
@@ -76,6 +75,7 @@ class JointSchemaTest(unittest.TestCase):
             "joint",
             {"arm_dim": [7, 7], "ee_dim": [12, 12]},
             "ego_h1_inspire",
+            "Humanoid-Close-Drawer-v0",
         )
         self.assertTrue(np.all(encoded["video"]["left_wrist"] == 0))
         self.assertTrue(np.all(encoded["video"]["right_wrist"] == 0))
@@ -88,19 +88,30 @@ class JointSchemaTest(unittest.TestCase):
             "joint",
             {"arm_dim": [7, 7], "ee_dim": [12, 12]},
             "ego_h1_inspire",
+            "Humanoid-Insert-And-Unload-Cans-v0",
         )
         self.assertTrue(np.all(encoded["video"]["left_wrist"] == 31))
         self.assertTrue(np.all(encoded["video"]["right_wrist"] == 47))
 
     def test_egovla_camera_and_prompt_contract_fail_closed(self) -> None:
         metadata = {"arm_dim": [7, 7], "ee_dim": [12, 12]}
-        with self.assertRaisesRegex(ValueError, "exact benchmark-registry instruction"):
+        with self.assertRaisesRegex(ValueError, "task/prompt mismatch"):
             _encode_observation(
                 self._egovla_observation("Perform the task"),
                 "unused",
                 "joint",
                 metadata,
                 "ego_h1_inspire",
+                "Humanoid-Close-Drawer-v0",
+            )
+        with self.assertRaisesRegex(ValueError, "task/prompt mismatch"):
+            _encode_observation(
+                self._egovla_observation("Open the closed drawer"),
+                "unused",
+                "joint",
+                metadata,
+                "ego_h1_inspire",
+                "Humanoid-Close-Drawer-v0",
             )
         with self.assertRaisesRegex(ValueError, "RGB uint8"):
             _encode_observation(
@@ -109,6 +120,7 @@ class JointSchemaTest(unittest.TestCase):
                 "joint",
                 metadata,
                 "ego_h1_inspire",
+                "Humanoid-Close-Drawer-v0",
             )
 
     def test_arx_metadata_resolver_regression(self) -> None:
@@ -144,9 +156,7 @@ class JointSchemaTest(unittest.TestCase):
         )
         self.assertEqual(list(groups), ["left_arm", "right_arm"])
         np.testing.assert_array_equal(groups["left_arm"], np.arange(7, dtype=np.float32))
-        np.testing.assert_array_equal(
-            groups["right_arm"], np.arange(10, 17, dtype=np.float32)
-        )
+        np.testing.assert_array_equal(groups["right_arm"], np.arange(10, 17, dtype=np.float32))
 
         action = {
             "left_arm": groups["left_arm"][None, None, :],

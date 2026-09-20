@@ -96,6 +96,47 @@ GR00T/Cosmos symlinks with Hugging Face offline, and checks that all requested
 GPUs are idle before a real launch. `GR00T_TRAIN_PREVIEW=1` performs the other
 checks and prints the full run identity without launching training.
 
+### EgoVLA raw-action training
+
+The EgoVLA launcher is deliberately fail-closed: it accepts exactly eight
+GPUs, global batch size 64, 80,000 optimizer steps, checkpoints every 10,000
+steps, and W&B online mode. It recomputes the full 38-D action/state stream
+digests before launch and rejects any dataset whose `action` differs from the
+same-timestep raw HDF5 `/action` provenance.
+
+```bash
+MODEL_ROOT=/path/to/GrootN17
+RAW_ROOT=/path/to/EgoVLA_raw_remove_deprecated
+DONOR_V30=/path/to/EgoVLA_benchmark_v30
+PY="$MODEL_ROOT/policy/GR00T_N17/gr00t_n17/.venv/bin/python"
+
+"$PY" "$MODEL_ROOT/data_scripts/prepare_egovla_v21_template.py" \
+  --source-v30 "$DONOR_V30" \
+  --source-raw "$RAW_ROOT" \
+  --output "$MODEL_ROOT/data/EgoVLA_benchmark_template_v21" \
+  --gr00t-root "$MODEL_ROOT/policy/GR00T_N17/gr00t_n17" \
+  --modality-config "$MODEL_ROOT/policy/GR00T_N17/configs/ego_h1_inspire_config.py"
+
+"$PY" "$MODEL_ROOT/data_scripts/convert_egovla_to_groot.py" \
+  --source-raw "$RAW_ROOT" \
+  --source-v21 "$MODEL_ROOT/data/EgoVLA_benchmark_template_v21" \
+  --output "$MODEL_ROOT/data/EgoVLA_benchmark_raw_action_v21" \
+  --gr00t-root "$MODEL_ROOT/policy/GR00T_N17/gr00t_n17" \
+  --modality-config "$MODEL_ROOT/policy/GR00T_N17/configs/ego_h1_inspire_config.py"
+
+EGO_VLA_DATASET_PATH="$MODEL_ROOT/data/EgoVLA_benchmark_raw_action_v21" \
+GR00T_BASE_MODEL=/path/to/GR00T-N1.7-3B \
+GR00T_COSMOS_MODEL=/path/to/Cosmos-Reason2-2B \
+WANDB_MODE=online \
+  bash "$MODEL_ROOT/policy/GR00T_N17/scripts/train_egovla_groot_joint38.sh"
+```
+
+The v2.1 preparation audit verifies all 5,709 videos, decodes every synthetic
+wrist frame, and compares RGB against raw HDF5 samples from all 12 tasks. The
+same camera contract is enforced at inference: only
+`Humanoid-Insert-And-Unload-Cans-v0` uses real wrists; all other tasks receive
+384×384 RGB black wrist images.
+
 ## Evaluation
 
 ```bash
@@ -122,7 +163,7 @@ the bridge):
 ```bash
 MODEL_ROOT=/personal/xiangpc/0811_Xpolicylab_bench/GrootN17
 EGO_ROOT="/personal/xiangpc/EgoVLA benchmark"
-CHECKPOINT="$MODEL_ROOT/policy/GR00T_N17/checkpoints/EgoVLA-all_tasks-ego_h1_inspire-joint-38d-seed0/checkpoint-20000"
+CHECKPOINT="$MODEL_ROOT/policy/GR00T_N17/checkpoints/EgoVLA-all_tasks-ego_h1_inspire-joint-38d-raw-action-seed42-20260920/checkpoint-20000"
 
 # Offline adapter/transport smoke; DEBUG_OBS_ENCODED also tests server-side
 # image decoding. It does not launch Isaac Sim.
@@ -141,9 +182,9 @@ prefix, or a conda environment. Checkpoints are resolved from an explicit
 `checkpoint-*` directory, `model_dir`, or the conventional run directory; the
 adapter verifies the 38-D modality groups before serving actions. The current
 EgoVLA bridge requires `env_cfg_type=ego_h1_inspire` and `action_type=joint`.
-The adapter canonicalizes the released benchmark's historical `andd then`
-instruction typo to the `and then` wording used in the audited training
-metadata.
+The adapter and training metadata both preserve the released benchmark's
+historical `andd then` instruction exactly, so train and inference prompts do
+not diverge.
 
 ## Configuration
 

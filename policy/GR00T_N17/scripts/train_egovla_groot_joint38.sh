@@ -13,10 +13,10 @@ DATASET_PATH="${EGO_VLA_DATASET_PATH:-${MODEL_ROOT}/data/EgoVLA_benchmark_raw_ac
 BASE_MODEL="${GR00T_BASE_MODEL:-${MODEL_ROOT}/pretrain_model/GR00T-N1.7-3B}"
 COSMOS_MODEL="${GR00T_COSMOS_MODEL:-${MODEL_ROOT}/pretrain_model/Cosmos-Reason2-2B}"
 MODALITY_CONFIG="${POLICY_DIR}/configs/ego_h1_inspire_config.py"
-EGOVLA_INTEGRATION_SRC="${EGOVLA_INTEGRATION_SRC:-/personal/xiangpc/EgoVLA benchmark/integration/src}"
-OBSERVATION_PROFILE_SCRIPT="${EGOVLA_INTEGRATION_SRC}/egovla_xpolicy/observation_profile.py"
-RUN_NAME="${GR00T_RUN_NAME:-EgoVLA-all_tasks-ego_h1_inspire-joint-38d-raw-action-seed0-20260920}"
+OBSERVATION_PROFILE_SCRIPT="${EGOVLA_OBSERVATION_PROFILE_SCRIPT:-${MODEL_ROOT}/data_scripts/profile_egovla_observations.py}"
+RUN_NAME="${GR00T_RUN_NAME:-EgoVLA-all_tasks-ego_h1_inspire-joint-38d-raw-action-seed42-20260920}"
 OUTPUT_ROOT="${GR00T_OUTPUT_ROOT:-${POLICY_DIR}/checkpoints}"
+TRAIN_SEED=42
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 GPU_COUNT="$(tr ',' '\n' <<< "${CUDA_VISIBLE_DEVICES}" | sed '/^$/d' | wc -l | xargs)"
@@ -39,10 +39,30 @@ export GR00T_VIDEO_BACKEND="${GR00T_VIDEO_BACKEND:-pyav}"
 # avoid repeating one ffprobe subprocess per camera/episode in every rank.
 export GR00T_TRUST_VIDEO_LENGTHS="${GR00T_TRUST_VIDEO_LENGTHS:-1}"
 export MASTER_PORT="${MASTER_PORT:-29517}"
+export PYTHONOPTIMIZE=0
 
 # ffprobe is required by the GR00T episode synchronisation check even when the
-# actual decoder is PyAV.  uv is not needed for this direct launcher.
-export PATH="/personal/miniconda3/bin:/personal/miniconda3/envs/Luminis/bin:${PATH}"
+# actual decoder is PyAV.  Keep host-specific PATH additions opt-in.
+if [[ -n "${GR00T_EXTRA_PATH:-}" ]]; then
+  export PATH="${GR00T_EXTRA_PATH}:${PATH}"
+fi
+command -v ffprobe >/dev/null 2>&1 || {
+  echo "ffprobe is required but was not found on PATH." >&2
+  exit 1
+}
+command -v nvidia-smi >/dev/null 2>&1 || {
+  echo "nvidia-smi is required for the 8-GPU launch preflight." >&2
+  exit 1
+}
+require_idle_gpus() {
+  local active_pids
+  active_pids="$(nvidia-smi --query-compute-apps=pid --format=csv,noheader,nounits | sed '/^[[:space:]]*$/d')"
+  if [[ -n "${active_pids}" ]]; then
+    echo "Refusing to launch while GPU compute processes are active: ${active_pids//$'\n'/,}" >&2
+    return 1
+  fi
+}
+require_idle_gpus
 export GR00T_COSMOS_MODEL="${COSMOS_MODEL}"
 # Prefer the GR00T checkout that belongs to this XPolicyLab model tree over an
 # editable package that may be installed in the shared base environment.
@@ -52,8 +72,16 @@ if [[ "${NUM_GPUS}" -ne "${GPU_COUNT}" ]]; then
   echo "NUM_GPUS=${NUM_GPUS} must match the number of visible GPUs (${GPU_COUNT})." >&2
   exit 2
 fi
+if [[ "${NUM_GPUS}" -ne 8 ]]; then
+  echo "This run requires exactly 8 GPUs, got NUM_GPUS=${NUM_GPUS}." >&2
+  exit 2
+fi
 if [[ "${GLOBAL_BATCH_SIZE}" -le 0 || $((GLOBAL_BATCH_SIZE % NUM_GPUS)) -ne 0 ]]; then
   echo "GLOBAL_BATCH_SIZE=${GLOBAL_BATCH_SIZE} must be divisible by NUM_GPUS=${NUM_GPUS}." >&2
+  exit 2
+fi
+if [[ "${GLOBAL_BATCH_SIZE}" -ne 64 ]]; then
+  echo "This run requires GLOBAL_BATCH_SIZE=64, got ${GLOBAL_BATCH_SIZE}." >&2
   exit 2
 fi
 if [[ $((GLOBAL_BATCH_SIZE / NUM_GPUS)) -ne 8 ]]; then
@@ -72,13 +100,21 @@ if [[ "${GRADIENT_ACCUMULATION_STEPS}" -ne 1 ]]; then
   echo "GRADIENT_ACCUMULATION_STEPS must be 1 so the optimizer batch remains exactly 64." >&2
   exit 2
 fi
-if [[ "${SAVE_TOTAL_LIMIT}" -lt 8 ]]; then
-  echo "SAVE_TOTAL_LIMIT must be at least 8 to retain checkpoints 10000 through 80000." >&2
+if [[ "${MAX_STEPS}" -ne 80000 || "${SAVE_STEPS}" -ne 10000 ]]; then
+  echo "This run requires MAX_STEPS=80000 and SAVE_STEPS=10000." >&2
   exit 2
 fi
-if [[ "${USE_WANDB}" == "1" && -z "${WANDB_API_KEY:-}" ]] && \
+if [[ "${SAVE_TOTAL_LIMIT}" -ne 8 ]]; then
+  echo "SAVE_TOTAL_LIMIT must be 8 to retain checkpoints 10000 through 80000." >&2
+  exit 2
+fi
+if [[ "${USE_WANDB}" != "1" || "${WANDB_MODE}" != "online" ]]; then
+  echo "This run requires USE_WANDB=1 and WANDB_MODE=online." >&2
+  exit 2
+fi
+if [[ -z "${WANDB_API_KEY:-}" ]] && \
   ! grep -Eq '^[[:space:]]*machine[[:space:]]+api\.wandb\.ai' /root/.netrc 2>/dev/null; then
-  echo "USE_WANDB=1 requires WANDB_API_KEY or an api.wandb.ai entry in /root/.netrc." >&2
+  echo "W&B online mode requires WANDB_API_KEY or an api.wandb.ai entry in /root/.netrc." >&2
   exit 1
 fi
 
@@ -89,13 +125,21 @@ if [[ -e "${RUN_OUTPUT}" ]]; then
 fi
 mkdir -p "${OUTPUT_ROOT}"
 mkdir -p "${RUN_OUTPUT}"
+TRAIN_LAUNCHED=0
+retain_failed_preflight() {
+  if [[ "${TRAIN_LAUNCHED}" == "0" && -d "${RUN_OUTPUT}" ]]; then
+    failed_output="${RUN_OUTPUT}.preflight-failed-$(date -u +%Y%m%dT%H%M%SZ)"
+    mv "${RUN_OUTPUT}" "${failed_output}" || true
+    echo "Preflight failed; diagnostics retained at ${failed_output}" >&2
+  fi
+}
+trap retain_failed_preflight ERR
 echo "[EgoVLA GR00T] dataset=${DATASET_PATH}"
 echo "[EgoVLA GR00T] run=${RUN_NAME} output=${OUTPUT_ROOT}/${RUN_NAME}"
 echo "[EgoVLA GR00T] GPUs=${CUDA_VISIBLE_DEVICES} global_bs=${GLOBAL_BATCH_SIZE} per_gpu_bs=$((GLOBAL_BATCH_SIZE / NUM_GPUS))"
 echo "[EgoVLA GR00T] max_steps=${MAX_STEPS} save_steps=${SAVE_STEPS} save_total_limit=${SAVE_TOTAL_LIMIT} wandb=${USE_WANDB}"
 
-PYTHONPATH="${EGOVLA_INTEGRATION_SRC}:${PYTHONPATH:-}" \
-  "${GR00T_ROOT}/.venv/bin/python" -m egovla_xpolicy.observation_profile \
+"${GR00T_ROOT}/.venv/bin/python" "${OBSERVATION_PROFILE_SCRIPT}" \
   --dataset "${DATASET_PATH}" \
   --output "${RUN_OUTPUT}/egovla_observation.json"
 
@@ -105,12 +149,14 @@ source .venv/bin/activate
 python - "${DATASET_PATH}" "${RUN_OUTPUT}" "${BASE_MODEL}" "${COSMOS_MODEL}" \
   "${MODALITY_CONFIG}" "${NUM_GPUS}" "${GLOBAL_BATCH_SIZE}" "${MAX_STEPS}" \
   "${SAVE_STEPS}" "${SAVE_TOTAL_LIMIT}" "${GRADIENT_ACCUMULATION_STEPS}" \
-  "${USE_WANDB}" "${WANDB_PROJECT}" <<'PY'
+  "${USE_WANDB}" "${WANDB_PROJECT}" "${TRAIN_SEED}" "${WANDB_MODE}" <<'PY'
 import hashlib
 import json
 from datetime import datetime, timezone
 from pathlib import Path
 import sys
+
+from gr00t.configs.data.data_config import DataConfig
 
 dataset = Path(sys.argv[1])
 run_output = Path(sys.argv[2])
@@ -121,11 +167,23 @@ num_gpus, global_batch_size, max_steps = map(int, sys.argv[6:9])
 save_steps, save_total_limit, grad_accum = map(int, sys.argv[9:12])
 use_wandb = sys.argv[12] == "1"
 wandb_project = sys.argv[13]
+training_seed = int(sys.argv[14])
+wandb_mode = sys.argv[15]
+
+if sys.flags.optimize != 0:
+    raise RuntimeError("EgoVLA contract checks require Python optimization to be disabled")
 
 def sha256(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
 
 manifest = json.loads((dataset / "meta/egovla_groot_conversion.json").read_text())
+assert training_seed == 42
+assert DataConfig().seed == training_seed
+assert use_wandb and wandb_mode == "online"
 for name, expected_sha256 in manifest["dataset_meta_sha256"].items():
     metadata_path = dataset / "meta" / name
     assert sha256(metadata_path) == expected_sha256, (
@@ -138,18 +196,51 @@ assert audit["training_action_source"] == "raw HDF5 /action at the same timestep
 assert audit["next_observed_state_used_as_action"] is False
 assert audit["episodes_rewritten"] == 1903
 assert audit["frames_rewritten"] == 510546
+assert audit["raw_action38_stream_sha256"] == (
+    "96dfbce561c21dd413845c50b05da6ce77f1a2b0e8dd2312bc25f85de4ebdfd2"
+)
+assert audit["raw_state38_stream_sha256"] == (
+    "78f21e4f2376c85d8deed8795ea190c87ee29b941e84834e8efe7814b4e80a7e"
+)
 assert manifest["action_type"] == "joint"
 assert manifest["action_dim"] == 38
 assert manifest["action_horizon"] == 16
-assert manifest["prompts"]["Insert-And-Unload-Cans"].endswith(
-    "unload the left cans andd then unload the right cans"
-)
+expected_prompts = {
+    "Pour-Balls": "pour balls in cup into bowl",
+    "Push-Box": "push box to the marker",
+    "Sort-Cans": "Put sprite cans to the left box, and orange cans to the right box",
+    "Insert-Cans": "Insert cans into the boxes",
+    "Close-Drawer": "Close the opened drawer",
+    "Open-Drawer": "Open the closed drawer",
+    "Insert-And-Unload-Cans": (
+        "Insert the left can into the slot and insert the right can into the slot, "
+        "unload the left cans andd then unload the right cans"
+    ),
+    "Flip-Mug": "Flip the mug",
+    "Unload-Cans": "unload the right cans and then unload the left cans",
+    "Stack-Can": "put can on the saucer",
+    "Stack-Can-Into-Drawer": "Open the drawer, and Put can on the saucer",
+    "Open-Laptop": "open the laptop",
+}
+assert manifest["prompts"] == expected_prompts
+tasks = [
+    json.loads(line)
+    for line in (dataset / "meta/tasks.jsonl").read_text().splitlines()
+    if line.strip()
+]
+assert [int(row["task_index"]) for row in tasks] == list(range(12))
+assert len({row["task"] for row in tasks}) == 12
+assert {row["task"] for row in tasks} == set(expected_prompts.values())
 assert manifest["action_representation"] == {
     "left_arm": "relative to same-timestep state (processor transform)",
     "right_arm": "relative to same-timestep state (processor transform)",
     "left_hand": "absolute",
     "right_hand": "absolute",
 }
+assert sha256(modality_config) == (
+    "fcdadfac0d6a94aacdd33ae07f5b87ef18e01b55926c50f3a42980ff454b2f86"
+)
+assert manifest["modality_config_sha256"] == sha256(modality_config)
 modality = json.loads((dataset / "meta/modality.json").read_text())
 for name, spec in modality["action"].items():
     assert spec.get("original_key", "action") == "action", (name, spec)
@@ -176,6 +267,32 @@ assert all(
 )
 
 processor_path = base_model / "processor_config.json"
+assert sha256(base_model / "config.json") == (
+    "54c0367060cd310d0b3343fe72a589860a8b6e8173810164a4ffd6253f52e689"
+)
+assert sha256(processor_path) == (
+    "85c1b4690ae090559e79a45193e598b65d6146eedf14750884da65e6d31032be"
+)
+assert sha256(cosmos_model / "config.json") == (
+    "bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b"
+)
+expected_weight_sha256 = {
+    base_model / "model.safetensors.index.json": (
+        "407804ea5a62f4f8823f48811ae0edbb82fac101e9cf4d7273e6e2f692bb4d59"
+    ),
+    base_model / "model-00001-of-00002.safetensors": (
+        "8a1a1d8a33c99103c7c80c136073c5bb8bfe9ca8f7a970c93c033ea89742906d"
+    ),
+    base_model / "model-00002-of-00002.safetensors": (
+        "c3f61940deb2007ba1ad7743013b57f0f8462356151db9655175d7aca2d40661"
+    ),
+    cosmos_model / "model.safetensors": (
+        "fa5a6e6ef4fce40216b185cc48a3b24d31637ac3e2ba69c107ed1f389c1e6ede"
+    ),
+}
+for weight_path, expected_sha256 in expected_weight_sha256.items():
+    assert weight_path.is_file(), weight_path
+    assert sha256(weight_path) == expected_sha256, weight_path
 processor_kwargs = json.loads(processor_path.read_text())["processor_kwargs"]
 processor_contract = {
     "image_target_size": processor_kwargs["image_target_size"],
@@ -183,6 +300,11 @@ processor_contract = {
     "shortest_image_edge": processor_kwargs["shortest_image_edge"],
     "crop_fraction": processor_kwargs["crop_fraction"],
     "formalize_language": processor_kwargs["formalize_language"],
+    "use_relative_action": processor_kwargs["use_relative_action"],
+    "apply_sincos_state_encoding": processor_kwargs["apply_sincos_state_encoding"],
+    "exclude_state": processor_kwargs["exclude_state"],
+    "use_mean_std": processor_kwargs["use_mean_std"],
+    "use_percentiles": processor_kwargs["use_percentiles"],
 }
 assert processor_contract == {
     "image_target_size": [256, 256],
@@ -190,6 +312,11 @@ assert processor_contract == {
     "shortest_image_edge": 256,
     "crop_fraction": 0.95,
     "formalize_language": True,
+    "use_relative_action": True,
+    "apply_sincos_state_encoding": False,
+    "exclude_state": False,
+    "use_mean_std": False,
+    "use_percentiles": True,
 }
 
 contract = {
@@ -224,23 +351,36 @@ contract = {
             "path": str(base_model.resolve()),
             "config_sha256": sha256(base_model / "config.json"),
             "processor_config_sha256": sha256(processor_path),
+            "weight_files_sha256": {
+                path.name: expected
+                for path, expected in expected_weight_sha256.items()
+                if path.parent == base_model
+            },
         },
         "cosmos_reason2_2b": {
             "path": str(cosmos_model.resolve()),
             "config_sha256": sha256(cosmos_model / "config.json"),
+            "weight_files_sha256": {
+                path.name: expected
+                for path, expected in expected_weight_sha256.items()
+                if path.parent == cosmos_model
+            },
         },
     },
     "training": {
         "modality_config": str(modality_config.resolve()),
         "modality_config_sha256": sha256(modality_config),
+        "embodiment_tag": "NEW_EMBODIMENT",
         "num_gpus": num_gpus,
         "global_batch_size": global_batch_size,
         "per_gpu_batch_size": global_batch_size // num_gpus,
         "gradient_accumulation_steps": grad_accum,
+        "seed": training_seed,
         "max_steps": max_steps,
         "save_steps": save_steps,
         "save_total_limit": save_total_limit,
         "wandb_enabled": use_wandb,
+        "wandb_mode": wandb_mode,
         "wandb_project": wandb_project,
     },
 }
@@ -256,6 +396,9 @@ if [[ "${USE_WANDB}" == "1" ]]; then
   WANDB_FLAG+=(--use-wandb)
 fi
 
+require_idle_gpus
+TRAIN_LAUNCHED=1
+trap - ERR
 exec torchrun --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
   gr00t/experiment/launch_finetune.py \
   --base-model-path "${BASE_MODEL}" \

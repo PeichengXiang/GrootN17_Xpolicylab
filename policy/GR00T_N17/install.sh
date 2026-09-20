@@ -1,5 +1,5 @@
-# XPolicyLab deploy: policy server env=uv; run setup_eval_policy_server.sh with this env.
 #!/usr/bin/env bash
+# XPolicyLab deploy: policy server env=uv; run setup_eval_policy_server.sh with this env.
 set -euo pipefail
 
 POLICY_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -23,11 +23,31 @@ cd "${GR00T_ROOT}"
 # honors [tool.uv.sources] / [[tool.uv.index]] while ignoring required-environments.
 uv venv --clear --python 3.10
 uv pip install -e .
-uv run python -c "import gr00t; print('GR00T ok')"
+.venv/bin/python -c "import gr00t; print('GR00T ok')"
 
 uv pip install -e "${XPOLICYLAB_ROOT}"
 uv pip install h5py pyyaml
-uv run python -c "import XPolicyLab; print('XPolicyLab ok')"
+# Only the lightweight LeRobot Python package is missing from the GR00T
+# environment. Its runtime dependencies are already supplied by GR00T; avoid a
+# second resolver pass that could replace the pinned torch/CUDA stack.
+uv pip install --no-deps "lerobot==0.4.4"
+.venv/bin/python -c "import av, h5py, lerobot, pyarrow, XPolicyLab; print('XPolicyLab/converter deps ok', lerobot.__version__)"
+.venv/bin/python - "${GR00T_ROOT}" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+converter_path = (
+    Path(sys.argv[1]) / "scripts" / "lerobot_conversion" / "convert_v3_to_v2.py"
+)
+spec = importlib.util.spec_from_file_location("groot_convert_v3_to_v2_smoke", converter_path)
+if spec is None or spec.loader is None:
+    raise ImportError(converter_path)
+module = importlib.util.module_from_spec(spec)
+sys.modules[spec.name] = module
+spec.loader.exec_module(module)
+print("GR00T v3-to-v2 converter imports ok")
+PY
 
 echo "[GR00T_N17] Installation finished."
 echo "[GR00T_N17] Policy server env: source ${GR00T_ROOT}/.venv/bin/activate"

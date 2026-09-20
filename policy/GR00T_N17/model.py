@@ -1,26 +1,27 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
+import hashlib
 import importlib.util
 import json
 import os
+from pathlib import Path
 import shutil
 import sys
 import tempfile
-import warnings
-from contextlib import contextmanager
-from pathlib import Path
 from typing import Any, Iterator
+import warnings
 
 import numpy as np
-
 from XPolicyLab.model_template import ModelTemplate
-from XPolicyLab.utils.checkpoint_resolver import resolve_checkpoint_root
 from XPolicyLab.utils.checkpoint_io import network_checkpoint_view
+from XPolicyLab.utils.checkpoint_resolver import resolve_checkpoint_root
 from XPolicyLab.utils.process_data import (
     get_robot_action_dim_info,
     pack_robot_state,
     unpack_robot_state,
 )
+
 
 _POLICY_DIR = Path(__file__).resolve().parent
 _GR00T_ROOT = _POLICY_DIR / "gr00t_n17"
@@ -36,6 +37,7 @@ if str(_GR00T_ROOT) not in sys.path:
 from gr00t.data.embodiment_tags import EmbodimentTag  # noqa: E402
 from gr00t.policy import Gr00tPolicy  # noqa: E402
 
+
 VIDEO_KEY_CANDIDATES = {
     "front": ["cam_head", "cam_high", "head_camera", "top_camera"],
     "left_wrist": ["cam_left_wrist", "left_camera", "left_wrist", "wrist_left"],
@@ -47,22 +49,24 @@ EGO_VLA_REAL_WRIST_PROMPT = (
     "Insert the left can into the slot and insert the right can into the slot, "
     "unload the left cans andd then unload the right cans"
 )
-EGO_VLA_TASK_PROMPTS = frozenset(
-    {
-        "pour balls in cup into bowl",
-        "push box to the marker",
-        "Put sprite cans to the left box, and orange cans to the right box",
-        "Insert cans into the boxes",
-        "Close the opened drawer",
-        "Open the closed drawer",
-        EGO_VLA_REAL_WRIST_PROMPT,
-        "Flip the mug",
-        "unload the right cans and then unload the left cans",
-        "put can on the saucer",
-        "Open the drawer, and Put can on the saucer",
-        "open the laptop",
-    }
-)
+EGO_VLA_REAL_WRIST_TASK = "Humanoid-Insert-And-Unload-Cans-v0"
+EGO_VLA_TASK_PROMPTS_BY_TASK = {
+    "Humanoid-Pour-Balls-v0": "pour balls in cup into bowl",
+    "Humanoid-Push-Box-v0": "push box to the marker",
+    "Humanoid-Sort-Cans-v0": ("Put sprite cans to the left box, and orange cans to the right box"),
+    "Humanoid-Insert-Cans-v0": "Insert cans into the boxes",
+    "Humanoid-Close-Drawer-v0": "Close the opened drawer",
+    "Humanoid-Open-Drawer-v0": "Open the closed drawer",
+    EGO_VLA_REAL_WRIST_TASK: EGO_VLA_REAL_WRIST_PROMPT,
+    "Humanoid-Flip-Mug-v0": "Flip the mug",
+    "Humanoid-Unload-Cans-v0": "unload the right cans and then unload the left cans",
+    "Humanoid-Stack-Can-v0": "put can on the saucer",
+    "Humanoid-Stack-Can-Into-Drawer-v0": "Open the drawer, and Put can on the saucer",
+    "Humanoid-Open-Laptop-v0": "open the laptop",
+}
+EGO_VLA_TASK_PROMPTS = frozenset(EGO_VLA_TASK_PROMPTS_BY_TASK.values())
+EGO_VLA_RAW_ACTION_SHA256 = "96dfbce561c21dd413845c50b05da6ce77f1a2b0e8dd2312bc25f85de4ebdfd2"
+EGO_VLA_RAW_STATE_SHA256 = "78f21e4f2376c85d8deed8795ea190c87ee29b941e84834e8efe7814b4e80a7e"
 
 
 def _validate_robot_action_dim_info(
@@ -83,9 +87,7 @@ def _validate_robot_action_dim_info(
                 f"got {dimensions!r}."
             )
         if any(
-            not isinstance(dimension, int)
-            or isinstance(dimension, bool)
-            or dimension <= 0
+            not isinstance(dimension, int) or isinstance(dimension, bool) or dimension <= 0
             for dimension in dimensions
         ):
             raise ValueError(
@@ -164,9 +166,8 @@ def _is_hf_repo_id(value: str) -> bool:
 
 def _resolve_cosmos_model(model_cfg: dict[str, Any]) -> str:
     """Return HuggingFace repo id or a local path for Cosmos (processor backbone)."""
-    raw_path = (
-        os.environ.get("GR00T_COSMOS_MODEL", "").strip()
-        or model_cfg.get("cosmos_model_path")
+    raw_path = os.environ.get("GR00T_COSMOS_MODEL", "").strip() or model_cfg.get(
+        "cosmos_model_path"
     )
     if raw_path is None or raw_path == "":
         return DEFAULT_COSMOS_MODEL_REPO
@@ -247,7 +248,10 @@ def _cpu_checkpoint_view(checkpoint_dir: Path, device: Any) -> Iterator[Path]:
         yield checkpoint_dir
         return
 
-    if not config.get("use_flash_attention") and config.get("attn_implementation") != "flash_attention_2":
+    if (
+        not config.get("use_flash_attention")
+        and config.get("attn_implementation") != "flash_attention_2"
+    ):
         yield checkpoint_dir
         return
 
@@ -296,7 +300,7 @@ def _resolve_checkpoint_dir(model_cfg: dict[str, Any]) -> Path:
         raise FileNotFoundError(f"Checkpoint root not found: {root}")
     # Web and the native CLI pass an absolute checkpoint-<step> path so the
     # selected epoch remains exact even when newer checkpoints appear later.
-    if _is_loadable_checkpoint_dir(root):
+    if root.name.startswith("checkpoint-") and _is_loadable_checkpoint_dir(root):
         return root.resolve()
 
     search_roots = [root]
@@ -308,6 +312,8 @@ def _resolve_checkpoint_dir(model_cfg: dict[str, Any]) -> Path:
     for search_root in search_roots:
         candidates.extend(sorted(search_root.glob("checkpoint-*"), key=lambda p: p.name))
     if not candidates:
+        if _is_loadable_checkpoint_dir(root):
+            return root.resolve()
         raise FileNotFoundError(f"No checkpoint-* directories under {root}")
 
     checkpoint_num = model_cfg.get("checkpoint_num")
@@ -332,6 +338,220 @@ def _resolve_checkpoint_dir(model_cfg: dict[str, Any]) -> Path:
         f"Checkpoint step {checkpoint_num!r} not found under {root}. "
         f"Available: {[p.name for p in candidates]}"
     )
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _require_equal(label: str, actual: Any, expected: Any) -> None:
+    if actual != expected:
+        raise ValueError(
+            f"EgoVLA checkpoint contract mismatch for {label}: {actual!r} != {expected!r}"
+        )
+
+
+def _validate_egovla_checkpoint_contract(checkpoint_dir: Path) -> dict[str, Any]:
+    """Reject checkpoints that are not bound to the audited raw-action run."""
+    contract_candidates = (
+        checkpoint_dir / "egovla_training_contract.json",
+        checkpoint_dir.parent / "egovla_training_contract.json",
+    )
+    contract_path = next((path for path in contract_candidates if path.is_file()), None)
+    if contract_path is None:
+        raise FileNotFoundError(
+            "EgoVLA checkpoint is missing egovla_training_contract.json; "
+            "old/unproven checkpoints are intentionally rejected"
+        )
+    with contract_path.open(encoding="utf-8") as stream:
+        contract = json.load(stream)
+
+    _require_equal("schema", contract.get("schema"), "egovla-groot-training-contract-v1")
+    action = contract.get("action", {})
+    _require_equal("action.source", action.get("source"), "raw HDF5 /action at the same timestep")
+    _require_equal(
+        "action.next_observed_state_used_as_action",
+        action.get("next_observed_state_used_as_action"),
+        False,
+    )
+    _require_equal("action.type", action.get("type"), "joint")
+    _require_equal("action.dimension", action.get("dimension"), 38)
+    _require_equal("action.horizon", action.get("horizon"), 16)
+    _require_equal(
+        "action.representation",
+        action.get("representation"),
+        {
+            "left_arm": "relative to same-timestep state (processor transform)",
+            "right_arm": "relative to same-timestep state (processor transform)",
+            "left_hand": "absolute",
+            "right_hand": "absolute",
+        },
+    )
+    dataset = contract.get("dataset", {})
+    _require_equal(
+        "dataset.raw_action38_stream_sha256",
+        dataset.get("raw_action38_stream_sha256"),
+        EGO_VLA_RAW_ACTION_SHA256,
+    )
+    _require_equal("dataset.episodes", dataset.get("episodes"), 1903)
+    _require_equal("dataset.frames", dataset.get("frames"), 510546)
+
+    expected_prompts = {
+        task.removeprefix("Humanoid-").removesuffix("-v0"): prompt
+        for task, prompt in EGO_VLA_TASK_PROMPTS_BY_TASK.items()
+    }
+    _require_equal("prompts", contract.get("prompts"), expected_prompts)
+    observation = contract.get("observation", {})
+    _require_equal(
+        "observation.processor",
+        observation.get("processor"),
+        {
+            "image_target_size": [256, 256],
+            "image_crop_size": [230, 230],
+            "shortest_image_edge": 256,
+            "crop_fraction": 0.95,
+            "formalize_language": True,
+            "use_relative_action": True,
+            "apply_sincos_state_encoding": False,
+            "exclude_state": False,
+            "use_mean_std": False,
+            "use_percentiles": True,
+        },
+    )
+    raw_camera = observation.get("raw_camera_contract", {})
+    _require_equal("observation.color_order", raw_camera.get("color_order"), "RGB")
+    _require_equal("observation.raw_shape_hwc", raw_camera.get("raw_shape_hwc"), [384, 384, 3])
+    _require_equal("observation.black_wrist_episodes", raw_camera.get("black_wrist_episodes"), 1003)
+    _require_equal("observation.real_wrist_episodes", raw_camera.get("real_wrist_episodes"), 900)
+
+    profile_candidates = (
+        checkpoint_dir / "egovla_observation.json",
+        contract_path.parent / "egovla_observation.json",
+    )
+    profile_path = next((path for path in profile_candidates if path.is_file()), None)
+    if profile_path is None:
+        raise FileNotFoundError("EgoVLA checkpoint is missing egovla_observation.json")
+    _require_equal(
+        "observation.profile_sha256",
+        _sha256(profile_path),
+        observation.get("profile_sha256"),
+    )
+    with profile_path.open(encoding="utf-8") as stream:
+        profile = json.load(stream)
+    _require_equal("profile.color_order", profile.get("color_order"), "RGB")
+    _require_equal(
+        "profile.camera_shapes",
+        profile.get("camera_shapes"),
+        {
+            "cam_head": [384, 384],
+            "cam_left_wrist": [384, 384],
+            "cam_right_wrist": [384, 384],
+        },
+    )
+    payload = profile.get("payload", {})
+    _require_equal(
+        "profile.raw_action38_stream_sha256",
+        payload.get("raw_action38_stream_sha256"),
+        EGO_VLA_RAW_ACTION_SHA256,
+    )
+    _require_equal(
+        "profile.raw_state38_stream_sha256",
+        payload.get("raw_state38_stream_sha256"),
+        EGO_VLA_RAW_STATE_SHA256,
+    )
+
+    training = contract.get("training", {})
+    _require_equal(
+        "training.modality_config_sha256",
+        training.get("modality_config_sha256"),
+        "fcdadfac0d6a94aacdd33ae07f5b87ef18e01b55926c50f3a42980ff454b2f86",
+    )
+    _require_equal("training.embodiment_tag", training.get("embodiment_tag"), "NEW_EMBODIMENT")
+    for name, expected in (
+        ("num_gpus", 8),
+        ("global_batch_size", 64),
+        ("per_gpu_batch_size", 8),
+        ("gradient_accumulation_steps", 1),
+        ("max_steps", 80000),
+        ("save_steps", 10000),
+        ("save_total_limit", 8),
+        ("seed", 42),
+        ("wandb_enabled", True),
+        ("wandb_mode", "online"),
+    ):
+        _require_equal(f"training.{name}", training.get(name), expected)
+
+    expected_pretrained = {
+        "groot_n17_3b": {
+            "config_sha256": "54c0367060cd310d0b3343fe72a589860a8b6e8173810164a4ffd6253f52e689",
+            "processor_config_sha256": "85c1b4690ae090559e79a45193e598b65d6146eedf14750884da65e6d31032be",
+            "weight_files_sha256": {
+                "model.safetensors.index.json": "407804ea5a62f4f8823f48811ae0edbb82fac101e9cf4d7273e6e2f692bb4d59",
+                "model-00001-of-00002.safetensors": "8a1a1d8a33c99103c7c80c136073c5bb8bfe9ca8f7a970c93c033ea89742906d",
+                "model-00002-of-00002.safetensors": "c3f61940deb2007ba1ad7743013b57f0f8462356151db9655175d7aca2d40661",
+            },
+        },
+        "cosmos_reason2_2b": {
+            "config_sha256": "bec4b3d446efa05807365c9e1cec03ac590836879d02f3a6da879971154bdd3b",
+            "weight_files_sha256": {
+                "model.safetensors": "fa5a6e6ef4fce40216b185cc48a3b24d31637ac3e2ba69c107ed1f389c1e6ede"
+            },
+        },
+    }
+    pretrained = contract.get("pretrained", {})
+    for model_name, expected in expected_pretrained.items():
+        actual = pretrained.get(model_name, {})
+        for field, value in expected.items():
+            _require_equal(f"pretrained.{model_name}.{field}", actual.get(field), value)
+
+    processor_path = checkpoint_dir / "processor_config.json"
+    if not processor_path.is_file() and (checkpoint_dir / "processor").is_dir():
+        processor_path = checkpoint_dir / "processor" / "processor_config.json"
+    if not processor_path.is_file():
+        raise FileNotFoundError(processor_path)
+    processor_kwargs = json.loads(processor_path.read_text(encoding="utf-8"))["processor_kwargs"]
+    for name, expected in observation["processor"].items():
+        _require_equal(f"checkpoint.processor.{name}", processor_kwargs.get(name), expected)
+    checkpoint_modalities = processor_kwargs.get("modality_configs", {}).get("new_embodiment", {})
+    expected_modality_specs = {
+        "video": {
+            "modality_keys": ["front", "left_wrist", "right_wrist"],
+            "delta_indices": [0],
+        },
+        "state": {
+            "modality_keys": ["left_arm", "right_arm", "left_hand", "right_hand"],
+            "delta_indices": [0],
+        },
+        "action": {
+            "modality_keys": ["left_arm", "right_arm", "left_hand", "right_hand"],
+            "delta_indices": list(range(16)),
+        },
+        "language": {
+            "modality_keys": ["annotation.human.task_description"],
+            "delta_indices": [0],
+        },
+    }
+    for modality_name, expected in expected_modality_specs.items():
+        actual = checkpoint_modalities.get(modality_name, {})
+        for field, value in expected.items():
+            _require_equal(
+                f"checkpoint.processor.new_embodiment.{modality_name}.{field}",
+                actual.get(field),
+                value,
+            )
+    _require_equal(
+        "checkpoint.processor.new_embodiment.action.action_configs",
+        checkpoint_modalities.get("action", {}).get("action_configs"),
+        [
+            {"format": "DEFAULT", "rep": rep, "state_key": None, "type": "NON_EEF"}
+            for rep in ("RELATIVE", "RELATIVE", "ABSOLUTE", "ABSOLUTE")
+        ],
+    )
+    return contract
 
 
 def _ensure_hwc_uint8(image: Any) -> np.ndarray:
@@ -513,18 +733,24 @@ def _encode_observation(
     action_type: str,
     robot_action_dim_info: dict[str, Any],
     env_cfg_type: str = "",
+    task_name: str = "",
 ) -> dict[str, Any]:
     prompt = _extract_prompt(obs, default_prompt)
     if env_cfg_type == "ego_h1_inspire":
-        if prompt not in EGO_VLA_TASK_PROMPTS:
+        expected_prompt = EGO_VLA_TASK_PROMPTS_BY_TASK.get(task_name)
+        if expected_prompt is None:
             raise ValueError(
-                "EgoVLA inference requires an exact benchmark-registry instruction; "
-                f"got {prompt!r}"
+                f"EgoVLA inference requires an exact supported task id; got task_name={task_name!r}"
+            )
+        if prompt != expected_prompt:
+            raise ValueError(
+                f"EgoVLA task/prompt mismatch for {task_name!r}: "
+                f"got {prompt!r}, expected {expected_prompt!r}"
             )
         front = _require_egovla_rgb(
             _extract_image_value(obs, VIDEO_KEY_CANDIDATES["front"]), "front"
         )
-        if prompt == EGO_VLA_REAL_WRIST_PROMPT:
+        if task_name == EGO_VLA_REAL_WRIST_TASK:
             left_wrist = _require_egovla_rgb(
                 _extract_image_value(obs, VIDEO_KEY_CANDIDATES["left_wrist"]),
                 "left_wrist",
@@ -552,12 +778,9 @@ def _encode_observation(
 
     return {
         "video": {
-            key: np.asarray(image, dtype=np.uint8)[None, None, ...]
-            for key, image in images.items()
+            key: np.asarray(image, dtype=np.uint8)[None, None, ...] for key, image in images.items()
         },
-        "state": {
-            key: value[None, None, :] for key, value in state_groups.items()
-        },
+        "state": {key: value[None, None, :] for key, value in state_groups.items()},
         "language": {
             "annotation.human.task_description": [[prompt]],
         },
@@ -615,20 +838,38 @@ class Model(ModelTemplate):
     def __init__(self, model_cfg: dict[str, Any]):
         self.model_cfg = model_cfg
         self.action_type = model_cfg.get("action_type", "joint")
-        self.default_prompt = model_cfg.get(
-            "default_prompt",
-            model_cfg.get("task_name", "Perform the robot manipulation task."),
-        )
         self.env_cfg_type = model_cfg["env_cfg_type"]
+        self.task_name = str(model_cfg.get("task_name", ""))
+        if self.env_cfg_type == "ego_h1_inspire":
+            if self.task_name not in EGO_VLA_TASK_PROMPTS_BY_TASK:
+                raise ValueError(f"Unsupported EgoVLA task_name={self.task_name!r}")
+            self.default_prompt = EGO_VLA_TASK_PROMPTS_BY_TASK[self.task_name]
+        else:
+            self.default_prompt = model_cfg.get(
+                "default_prompt",
+                self.task_name or "Perform the robot manipulation task.",
+            )
         self.robot_action_dim_info = _resolve_robot_action_dim_info(self.env_cfg_type)
         self.device = model_cfg.get("device", "cuda:0" if self._has_cuda() else "cpu")
 
         _load_modality_config(self.env_cfg_type)
         checkpoint_dir = _resolve_checkpoint_dir(model_cfg)
+        if self.env_cfg_type == "ego_h1_inspire":
+            _validate_egovla_checkpoint_contract(checkpoint_dir)
         embodiment_tag = model_cfg.get("embodiment_tag", "NEW_EMBODIMENT")
+        if self.env_cfg_type == "ego_h1_inspire":
+            embodiment_tag = EmbodimentTag.resolve(embodiment_tag)
+            _require_equal(
+                "checkpoint.embodiment_tag",
+                embodiment_tag,
+                EmbodimentTag.NEW_EMBODIMENT,
+            )
         cosmos_model = _resolve_cosmos_model(model_cfg)
 
-        with network_checkpoint_view(checkpoint_dir) as network_dir, _cpu_checkpoint_view(network_dir, self.device) as load_dir:
+        with (
+            network_checkpoint_view(checkpoint_dir) as network_dir,
+            _cpu_checkpoint_view(network_dir, self.device) as load_dir,
+        ):
             with _override_processor_cosmos_model(load_dir, cosmos_model):
                 self.policy = Gr00tPolicy(
                     model_path=str(load_dir),
@@ -646,6 +887,57 @@ class Model(ModelTemplate):
                     f"env_cfg_type={self.env_cfg_type!r} metadata groups {expected_groups}. "
                     "Use a checkpoint trained for this robot schema."
                 )
+        if self.env_cfg_type == "ego_h1_inspire":
+            _require_equal(
+                "checkpoint.processor.use_relative_action",
+                self.policy.processor.use_relative_action,
+                True,
+            )
+            _require_equal(
+                "checkpoint.processor.state_action_processor.use_relative_action",
+                self.policy.processor.state_action_processor.use_relative_action,
+                True,
+            )
+            expected_modalities = {
+                "video": (["front", "left_wrist", "right_wrist"], [0]),
+                "state": (expected_groups, [0]),
+                "action": (expected_groups, list(range(16))),
+                "language": (["annotation.human.task_description"], [0]),
+            }
+            for modality_name, (modality_keys, delta_indices) in expected_modalities.items():
+                modality = self.policy.modality_configs[modality_name]
+                _require_equal(
+                    f"checkpoint.{modality_name}.modality_keys",
+                    list(modality.modality_keys),
+                    modality_keys,
+                )
+                _require_equal(
+                    f"checkpoint.{modality_name}.delta_indices",
+                    list(modality.delta_indices),
+                    delta_indices,
+                )
+            action_modality = self.policy.modality_configs["action"]
+            action_configs = action_modality.action_configs or []
+            _require_equal(
+                "checkpoint.action.representations",
+                [config.rep.value for config in action_configs],
+                ["relative", "relative", "absolute", "absolute"],
+            )
+            _require_equal(
+                "checkpoint.action.types",
+                [config.type.value for config in action_configs],
+                ["non_eef"] * 4,
+            )
+            _require_equal(
+                "checkpoint.action.formats",
+                [config.format.value for config in action_configs],
+                ["default"] * 4,
+            )
+            _require_equal(
+                "checkpoint.action.state_keys",
+                [config.state_key for config in action_configs],
+                [None] * 4,
+            )
         self.action_horizon = len(self.policy.modality_configs["action"].delta_indices)
 
         self._obs_list: list[dict[str, Any]] = []
@@ -679,6 +971,7 @@ class Model(ModelTemplate):
                 self.action_type,
                 self.robot_action_dim_info,
                 self.env_cfg_type,
+                self.task_name,
             )
             for obs in obs_list
         ]
