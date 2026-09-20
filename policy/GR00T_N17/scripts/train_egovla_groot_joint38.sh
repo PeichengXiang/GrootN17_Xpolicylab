@@ -557,7 +557,8 @@ fi
 require_idle_gpus
 TRAIN_LAUNCHED=1
 trap - ERR
-exec torchrun --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
+exec "${GR00T_ROOT}/.venv/bin/torchrun" \
+  --nproc_per_node="${NUM_GPUS}" --master_port="${MASTER_PORT}" \
   gr00t/experiment/launch_finetune.py \
   --base-model-path "${BASE_MODEL}" \
   --dataset-path "${DATASET_PATH}" \
