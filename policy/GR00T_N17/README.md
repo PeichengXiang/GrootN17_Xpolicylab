@@ -129,6 +129,10 @@ GR00T_BASE_MODEL=/path/to/GR00T-N1.7-3B \
 GR00T_COSMOS_MODEL=/path/to/Cosmos-Reason2-2B \
 WANDB_MODE=online \
   bash "$MODEL_ROOT/policy/GR00T_N17/scripts/train_egovla_groot_joint38.sh"
+
+# If the same run was interrupted after a complete checkpoint, re-run the same
+# command with GR00T_RESUME=1. The wrapper re-audits the full dataset, compares
+# the immutable training contract, and resumes both Trainer and W&B state.
 ```
 
 The v2.1 preparation audit verifies all 5,709 videos, decodes every synthetic

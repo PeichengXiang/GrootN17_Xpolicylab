@@ -17,6 +17,7 @@ OBSERVATION_PROFILE_SCRIPT="${EGOVLA_OBSERVATION_PROFILE_SCRIPT:-${MODEL_ROOT}/d
 RUN_NAME="${GR00T_RUN_NAME:-EgoVLA-all_tasks-ego_h1_inspire-joint-38d-raw-action-seed42-20260920}"
 OUTPUT_ROOT="${GR00T_OUTPUT_ROOT:-${POLICY_DIR}/checkpoints}"
 TRAIN_SEED=42
+RESUME_MODE="${GR00T_RESUME:-0}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3,4,5,6,7}"
 GPU_COUNT="$(tr ',' '\n' <<< "${CUDA_VISIBLE_DEVICES}" | sed '/^$/d' | wc -l | xargs)"
@@ -112,6 +113,10 @@ if [[ "${USE_WANDB}" != "1" || "${WANDB_MODE}" != "online" ]]; then
   echo "This run requires USE_WANDB=1 and WANDB_MODE=online." >&2
   exit 2
 fi
+if [[ "${RESUME_MODE}" != "0" && "${RESUME_MODE}" != "1" ]]; then
+  echo "GR00T_RESUME must be 0 or 1, got ${RESUME_MODE}." >&2
+  exit 2
+fi
 if [[ -z "${WANDB_API_KEY:-}" ]] && \
   ! grep -Eq '^[[:space:]]*machine[[:space:]]+api\.wandb\.ai' /root/.netrc 2>/dev/null; then
   echo "W&B online mode requires WANDB_API_KEY or an api.wandb.ai entry in /root/.netrc." >&2
@@ -119,15 +124,45 @@ if [[ -z "${WANDB_API_KEY:-}" ]] && \
 fi
 
 RUN_OUTPUT="${OUTPUT_ROOT}/${RUN_NAME}"
+NEW_RUN=1
+PROFILE_CHECK_PATH=""
 if [[ -e "${RUN_OUTPUT}" ]]; then
-  echo "Refusing to merge a fresh run into existing output: ${RUN_OUTPUT}" >&2
-  exit 1
+  if [[ "${RESUME_MODE}" != "1" ]]; then
+    echo "Existing output requires explicit GR00T_RESUME=1: ${RUN_OUTPUT}" >&2
+    exit 1
+  fi
+  for required in "${RUN_OUTPUT}/egovla_observation.json" \
+    "${RUN_OUTPUT}/egovla_training_contract.json"; do
+    [[ -f "${required}" ]] || { echo "Resume sidecar is missing: ${required}" >&2; exit 1; }
+  done
+  compgen -G "${RUN_OUTPUT}/checkpoint-*/trainer_state.json" >/dev/null || {
+    echo "Resume requested but no complete trainer checkpoint exists under ${RUN_OUTPUT}." >&2
+    exit 1
+  }
+  NEW_RUN=0
+  PROFILE_CHECK_PATH="${RUN_OUTPUT}/.egovla_observation.resume-check-$$-${RANDOM}.json"
+  if [[ -z "${WANDB_RUN_ID:-}" ]]; then
+    WANDB_RUN_ID="$("${GR00T_ROOT}/.venv/bin/python" -c \
+      'import json,sys; print(json.load(open(sys.argv[1]))["training"]["wandb_run_id"])' \
+      "${RUN_OUTPUT}/egovla_training_contract.json")"
+  fi
+else
+  if [[ "${RESUME_MODE}" == "1" ]]; then
+    echo "GR00T_RESUME=1 was requested but the run output does not exist: ${RUN_OUTPUT}" >&2
+    exit 1
+  fi
+  WANDB_RUN_ID="${WANDB_RUN_ID:-$("${GR00T_ROOT}/.venv/bin/python" -c 'import secrets; print(secrets.token_hex(8))')}"
 fi
+export WANDB_RUN_ID
+export WANDB_RESUME=allow
 mkdir -p "${OUTPUT_ROOT}"
 mkdir -p "${RUN_OUTPUT}"
 TRAIN_LAUNCHED=0
 retain_failed_preflight() {
-  if [[ "${TRAIN_LAUNCHED}" == "0" && -d "${RUN_OUTPUT}" ]]; then
+  if [[ -n "${PROFILE_CHECK_PATH}" ]]; then
+    rm -f "${PROFILE_CHECK_PATH}" || true
+  fi
+  if [[ "${TRAIN_LAUNCHED}" == "0" && "${NEW_RUN}" == "1" && -d "${RUN_OUTPUT}" ]]; then
     failed_output="${RUN_OUTPUT}.preflight-failed-$(date -u +%Y%m%dT%H%M%SZ)"
     mv "${RUN_OUTPUT}" "${failed_output}" || true
     echo "Preflight failed; diagnostics retained at ${failed_output}" >&2
@@ -136,12 +171,19 @@ retain_failed_preflight() {
 trap retain_failed_preflight ERR
 echo "[EgoVLA GR00T] dataset=${DATASET_PATH}"
 echo "[EgoVLA GR00T] run=${RUN_NAME} output=${OUTPUT_ROOT}/${RUN_NAME}"
+echo "[EgoVLA GR00T] resume=${RESUME_MODE} wandb_run_id=${WANDB_RUN_ID}"
 echo "[EgoVLA GR00T] GPUs=${CUDA_VISIBLE_DEVICES} global_bs=${GLOBAL_BATCH_SIZE} per_gpu_bs=$((GLOBAL_BATCH_SIZE / NUM_GPUS))"
 echo "[EgoVLA GR00T] max_steps=${MAX_STEPS} save_steps=${SAVE_STEPS} save_total_limit=${SAVE_TOTAL_LIMIT} wandb=${USE_WANDB}"
 
-"${GR00T_ROOT}/.venv/bin/python" "${OBSERVATION_PROFILE_SCRIPT}" \
-  --dataset "${DATASET_PATH}" \
-  --output "${RUN_OUTPUT}/egovla_observation.json"
+if [[ "${RESUME_MODE}" == "1" ]]; then
+  "${GR00T_ROOT}/.venv/bin/python" "${OBSERVATION_PROFILE_SCRIPT}" \
+    --dataset "${DATASET_PATH}" \
+    --output "${PROFILE_CHECK_PATH}"
+else
+  "${GR00T_ROOT}/.venv/bin/python" "${OBSERVATION_PROFILE_SCRIPT}" \
+    --dataset "${DATASET_PATH}" \
+    --output "${RUN_OUTPUT}/egovla_observation.json"
+fi
 
 cd "${GR00T_ROOT}"
 source .venv/bin/activate
@@ -149,7 +191,8 @@ source .venv/bin/activate
 python - "${DATASET_PATH}" "${RUN_OUTPUT}" "${BASE_MODEL}" "${COSMOS_MODEL}" \
   "${MODALITY_CONFIG}" "${NUM_GPUS}" "${GLOBAL_BATCH_SIZE}" "${MAX_STEPS}" \
   "${SAVE_STEPS}" "${SAVE_TOTAL_LIMIT}" "${GRADIENT_ACCUMULATION_STEPS}" \
-  "${USE_WANDB}" "${WANDB_PROJECT}" "${TRAIN_SEED}" "${WANDB_MODE}" <<'PY'
+  "${USE_WANDB}" "${WANDB_PROJECT}" "${TRAIN_SEED}" "${WANDB_MODE}" \
+  "${WANDB_RUN_ID}" "${RESUME_MODE}" "${PROFILE_CHECK_PATH}" <<'PY'
 import hashlib
 import json
 from datetime import datetime, timezone
@@ -169,6 +212,9 @@ use_wandb = sys.argv[12] == "1"
 wandb_project = sys.argv[13]
 training_seed = int(sys.argv[14])
 wandb_mode = sys.argv[15]
+wandb_run_id = sys.argv[16]
+resume_mode = sys.argv[17] == "1"
+profile_check_path = Path(sys.argv[18]) if sys.argv[18] else None
 
 if sys.flags.optimize != 0:
     raise RuntimeError("EgoVLA contract checks require Python optimization to be disabled")
@@ -247,6 +293,17 @@ for name, spec in modality["action"].items():
 
 profile_path = run_output / "egovla_observation.json"
 profile = json.loads(profile_path.read_text())
+if resume_mode:
+    if profile_check_path is None or not profile_check_path.is_file():
+        raise FileNotFoundError("resume observation re-audit was not produced")
+    fresh_profile = json.loads(profile_check_path.read_text())
+    stable_profile = dict(profile)
+    stable_fresh_profile = dict(fresh_profile)
+    stable_profile.pop("created_at_utc", None)
+    stable_fresh_profile.pop("created_at_utc", None)
+    if stable_profile != stable_fresh_profile:
+        raise ValueError("resume dataset observation profile differs from the original run")
+    profile_check_path.unlink()
 assert profile["schema"] == "egovla-observation-profile-v1"
 assert profile["color_order"] == "RGB"
 assert profile["camera_shapes"] == {
@@ -382,12 +439,20 @@ contract = {
         "wandb_enabled": use_wandb,
         "wandb_mode": wandb_mode,
         "wandb_project": wandb_project,
+        "wandb_run_id": wandb_run_id,
     },
 }
 contract_path = run_output / "egovla_training_contract.json"
-with contract_path.open("x", encoding="utf-8") as stream:
-    json.dump(contract, stream, ensure_ascii=False, indent=2, sort_keys=True)
-    stream.write("\n")
+if resume_mode:
+    existing_contract = json.loads(contract_path.read_text())
+    contract["created_at_utc"] = existing_contract.get("created_at_utc")
+    if contract != existing_contract:
+        raise ValueError("resume training contract differs from the original run")
+    print("[EgoVLA GR00T] resume contract and full dataset re-audit verified")
+else:
+    with contract_path.open("x", encoding="utf-8") as stream:
+        json.dump(contract, stream, ensure_ascii=False, indent=2, sort_keys=True)
+        stream.write("\n")
 print("[EgoVLA GR00T] raw-action, camera, prompt, processor, and pretrained contracts verified")
 PY
 
