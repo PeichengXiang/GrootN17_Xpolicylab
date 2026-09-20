@@ -135,10 +135,42 @@ if [[ -e "${RUN_OUTPUT}" ]]; then
     "${RUN_OUTPUT}/egovla_training_contract.json"; do
     [[ -f "${required}" ]] || { echo "Resume sidecar is missing: ${required}" >&2; exit 1; }
   done
-  compgen -G "${RUN_OUTPUT}/checkpoint-*/trainer_state.json" >/dev/null || {
-    echo "Resume requested but no complete trainer checkpoint exists under ${RUN_OUTPUT}." >&2
-    exit 1
-  }
+  RESUME_CHECKPOINT="$("${GR00T_ROOT}/.venv/bin/python" - "${RUN_OUTPUT}" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+run_output = Path(sys.argv[1])
+candidates = []
+for path in run_output.iterdir():
+    match = re.fullmatch(r"checkpoint-(\d+)", path.name)
+    if path.is_dir() and match:
+        candidates.append((int(match.group(1)), path))
+if not candidates:
+    raise FileNotFoundError(f"no numeric checkpoint-* directory under {run_output}")
+checkpoint = max(candidates)[1]
+for name in (
+    "trainer_state.json",
+    "config.json",
+    "processor_config.json",
+    "egovla_training_contract.json",
+    "egovla_observation.json",
+):
+    if not (checkpoint / name).is_file():
+        raise FileNotFoundError(f"latest checkpoint is incomplete: {checkpoint / name}")
+if not (
+    (checkpoint / "model.safetensors").is_file()
+    or (checkpoint / "model.safetensors.index.json").is_file()
+):
+    raise FileNotFoundError(f"latest checkpoint has no model weights: {checkpoint}")
+deepspeed_files = [path for path in checkpoint.glob("global_step*/**/*") if path.is_file()]
+if not any(path.name.endswith("_optim_states.pt") for path in deepspeed_files):
+    raise FileNotFoundError(f"latest checkpoint has no DeepSpeed optimizer state: {checkpoint}")
+if not any(path.name.endswith("_model_states.pt") for path in deepspeed_files):
+    raise FileNotFoundError(f"latest checkpoint has no DeepSpeed model/scheduler state: {checkpoint}")
+print(checkpoint)
+PY
+)"
   NEW_RUN=0
   PROFILE_CHECK_PATH="${RUN_OUTPUT}/.egovla_observation.resume-check-$$-${RANDOM}.json"
   if [[ -z "${WANDB_RUN_ID:-}" ]]; then
@@ -172,6 +204,9 @@ trap retain_failed_preflight ERR
 echo "[EgoVLA GR00T] dataset=${DATASET_PATH}"
 echo "[EgoVLA GR00T] run=${RUN_NAME} output=${OUTPUT_ROOT}/${RUN_NAME}"
 echo "[EgoVLA GR00T] resume=${RESUME_MODE} wandb_run_id=${WANDB_RUN_ID}"
+if [[ "${RESUME_MODE}" == "1" ]]; then
+  echo "[EgoVLA GR00T] latest complete checkpoint=${RESUME_CHECKPOINT}"
+fi
 echo "[EgoVLA GR00T] GPUs=${CUDA_VISIBLE_DEVICES} global_bs=${GLOBAL_BATCH_SIZE} per_gpu_bs=$((GLOBAL_BATCH_SIZE / NUM_GPUS))"
 echo "[EgoVLA GR00T] max_steps=${MAX_STEPS} save_steps=${SAVE_STEPS} save_total_limit=${SAVE_TOTAL_LIMIT} wandb=${USE_WANDB}"
 
