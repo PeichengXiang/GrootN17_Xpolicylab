@@ -42,6 +42,21 @@ export GR00T_TRUST_VIDEO_LENGTHS="${GR00T_TRUST_VIDEO_LENGTHS:-1}"
 export MASTER_PORT="${MASTER_PORT:-29517}"
 export PYTHONOPTIMIZE=0
 
+# DeepSpeed 0.17.6 inspects optional CUDA operators during import.  A matching
+# CUDA toolkit (not only the PyTorch runtime wheels) must therefore be visible.
+# GR00T_CUDA_HOME lets cluster launchers select a host-specific shared toolkit
+# without hard-coding that path in this portable script.
+if [[ -n "${GR00T_CUDA_HOME:-}" ]]; then
+  export CUDA_HOME="${GR00T_CUDA_HOME}"
+elif [[ -z "${CUDA_HOME:-}" ]] && command -v nvcc >/dev/null 2>&1; then
+  export CUDA_HOME="$(cd "$(dirname "$(command -v nvcc)")/.." && pwd)"
+fi
+if [[ -z "${CUDA_HOME:-}" || ! -x "${CUDA_HOME}/bin/nvcc" ]]; then
+  echo "A CUDA toolkit with bin/nvcc is required by DeepSpeed; set GR00T_CUDA_HOME." >&2
+  exit 1
+fi
+export PATH="${CUDA_HOME}/bin:${PATH}"
+
 # ffprobe is required by the GR00T episode synchronisation check even when the
 # actual decoder is PyAV.  Keep host-specific PATH additions opt-in.
 if [[ -n "${GR00T_EXTRA_PATH:-}" ]]; then
@@ -68,6 +83,49 @@ export GR00T_COSMOS_MODEL="${COSMOS_MODEL}"
 # Prefer the GR00T checkout that belongs to this XPolicyLab model tree over an
 # editable package that may be installed in the shared base environment.
 export PYTHONPATH="${GR00T_ROOT}:${MODEL_ROOT}:${PYTHONPATH:-}"
+
+"${GR00T_ROOT}/.venv/bin/python" - "${CUDA_HOME}" <<'PY'
+from pathlib import Path
+import re
+import subprocess
+import sys
+
+import torch
+
+cuda_home = Path(sys.argv[1])
+nvcc_output = subprocess.check_output(
+    [str(cuda_home / "bin/nvcc"), "-V"], text=True
+)
+match = re.search(r"release\s+(\d+)\.(\d+)", nvcc_output)
+if match is None:
+    raise RuntimeError(f"could not parse CUDA version from nvcc output: {nvcc_output!r}")
+nvcc_version = tuple(map(int, match.groups()))
+if torch.version.cuda is None:
+    raise RuntimeError("the installed PyTorch build has no CUDA support")
+torch_cuda_version = tuple(map(int, torch.version.cuda.split(".")[:2]))
+if nvcc_version != torch_cuda_version:
+    raise RuntimeError(
+        f"CUDA toolkit {nvcc_version} does not exactly match PyTorch CUDA "
+        f"{torch_cuda_version}"
+    )
+if not torch.cuda.is_available() or torch.cuda.device_count() != 8:
+    raise RuntimeError(
+        f"expected 8 available CUDA devices, got {torch.cuda.device_count()}"
+    )
+
+import deepspeed
+from deepspeed.accelerator import get_accelerator
+
+if get_accelerator().device_name() != "cuda":
+    raise RuntimeError(
+        f"DeepSpeed selected accelerator {get_accelerator().device_name()!r}, not 'cuda'"
+    )
+print(
+    "[EgoVLA GR00T] CUDA/DeepSpeed preflight verified: "
+    f"torch={torch.__version__} cuda={torch.version.cuda} "
+    f"deepspeed={deepspeed.__version__} devices={torch.cuda.device_count()}"
+)
+PY
 
 if [[ "${NUM_GPUS}" -ne "${GPU_COUNT}" ]]; then
   echo "NUM_GPUS=${NUM_GPUS} must match the number of visible GPUs (${GPU_COUNT})." >&2
