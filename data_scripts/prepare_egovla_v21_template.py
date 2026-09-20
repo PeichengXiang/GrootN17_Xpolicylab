@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from fractions import Fraction
 import hashlib
 from importlib.metadata import PackageNotFoundError, version
 import importlib.util
@@ -138,6 +139,156 @@ def decode_first_rgb(path: Path) -> np.ndarray:
         return frame.to_ndarray(format="rgb24")
 
 
+def frame_number_at_30hz(timestamp: object, context: str) -> int:
+    """Map rounded decimal timestamps back to their exact CFR frame index."""
+
+    frame_number = Fraction(str(timestamp)) * 30
+    nearest = round(frame_number)
+    if abs(frame_number - nearest) > Fraction(1, 1000):
+        raise ValueError(f"{context}: non-integral 30 Hz timestamp {timestamp}")
+    return nearest
+
+
+def probe_source_video_group(
+    job: tuple[Path, str, list[dict[str, Any]], str],
+) -> dict[str, Any]:
+    """Prove that every stream-copy boundary is an exact 30 Hz keyframe."""
+
+    path, video_key, records, relative_path = job
+    completed = subprocess.run(
+        [
+            "ffprobe",
+            "-v",
+            "error",
+            "-select_streams",
+            "v:0",
+            "-skip_frame",
+            "nokey",
+            "-show_frames",
+            "-show_entries",
+            "stream=width,height,r_frame_rate,nb_frames:frame=best_effort_timestamp_time",
+            "-of",
+            "json",
+            str(path),
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    payload = json.loads(completed.stdout)
+    streams = payload.get("streams", [])
+    if len(streams) != 1:
+        raise ValueError(f"{path}: expected one source video stream, got {len(streams)}")
+    stream = streams[0]
+    records = sorted(
+        records,
+        key=lambda item: frame_number_at_30hz(
+            item[f"videos/{video_key}/from_timestamp"], str(path)
+        ),
+    )
+    expected_total = sum(
+        int(item["dataset_to_index"]) - int(item["dataset_from_index"])
+        for item in records
+    )
+    if (
+        int(stream.get("width", -1)) != 384
+        or int(stream.get("height", -1)) != 384
+        or stream.get("r_frame_rate") != "30/1"
+        or int(stream.get("nb_frames", -1)) != expected_total
+    ):
+        raise ValueError(
+            f"{path}: source frames/shape/fps={stream.get('nb_frames')}/"
+            f"{stream.get('height')}x{stream.get('width')}/"
+            f"{stream.get('r_frame_rate')}, expected={expected_total}/384x384/30"
+        )
+
+    keyframes: set[int] = set()
+    for frame in payload.get("frames", []):
+        keyframes.add(
+            frame_number_at_30hz(frame["best_effort_timestamp_time"], str(path))
+        )
+
+    cursor = 0
+    for item in records:
+        episode_index = int(item["episode_index"])
+        start_frame = frame_number_at_30hz(
+            item[f"videos/{video_key}/from_timestamp"],
+            f"{path}: episode {episode_index} start",
+        )
+        end_frame = frame_number_at_30hz(
+            item[f"videos/{video_key}/to_timestamp"],
+            f"{path}: episode {episode_index} end",
+        )
+        length = int(item["dataset_to_index"]) - int(item["dataset_from_index"])
+        if start_frame != cursor or end_frame - start_frame != length:
+            raise ValueError(
+                f"{path}: episode {episode_index} boundary mismatch: "
+                f"start/end={start_frame}/{end_frame}, cursor/length={cursor}/{length}"
+            )
+        if start_frame not in keyframes:
+            raise ValueError(
+                f"{path}: episode {episode_index} starts at non-keyframe {start_frame}"
+            )
+        cursor = end_frame
+    if cursor != expected_total:
+        raise ValueError(f"{path}: consumed {cursor} frames, expected {expected_total}")
+    return {
+        "relative_path": relative_path,
+        "episodes": len(records),
+        "frames": expected_total,
+        "episode_start_keyframes": len(records),
+    }
+
+
+def audit_source_video_boundaries(
+    source: Path,
+    episode_records: list[dict[str, Any]],
+    video_keys: list[str],
+    converter: ModuleType,
+    workers: int,
+) -> dict[str, Any]:
+    """Fail closed unless stream-copy can split every episode without drift."""
+
+    result: dict[str, Any] = {}
+    for video_key in video_keys:
+        grouped = converter._group_episodes_by_video_file(episode_records, video_key)
+        jobs: list[tuple[Path, str, list[dict[str, Any]], str]] = []
+        for (chunk_index, file_index), records in sorted(grouped.items()):
+            relative = converter.DEFAULT_VIDEO_PATH.format(
+                video_key=video_key,
+                chunk_index=chunk_index,
+                file_index=file_index,
+            )
+            path = source / relative
+            if not path.is_file():
+                raise FileNotFoundError(path)
+            jobs.append((path, video_key, records, relative))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            rows = list(pool.map(probe_source_video_group, jobs))
+        episodes = sum(int(row["episodes"]) for row in rows)
+        frames = sum(int(row["frames"]) for row in rows)
+        if episodes != 1903 or frames != 510546:
+            raise ValueError(
+                f"{video_key}: source boundary audit expected 1903/510546, "
+                f"got {episodes}/{frames}"
+            )
+        result[video_key] = {
+            "source_files": len(rows),
+            "episodes": episodes,
+            "frames": frames,
+            "episode_start_keyframes": sum(
+                int(row["episode_start_keyframes"]) for row in rows
+            ),
+        }
+        print(
+            f"SOURCE_VIDEO_BOUNDARIES_OK key={video_key} "
+            f"files={len(rows)} episodes={episodes} frames={frames}",
+            flush=True,
+        )
+    return result
+
+
 def video_path(dataset: Path, key: str, episode_index: int, chunks_size: int) -> Path:
     return (
         dataset
@@ -156,6 +307,7 @@ def audit_v21_videos(
     workers: int,
     source_manifest: dict[str, Any],
     raw_source: Path,
+    source_boundary_audit: dict[str, Any],
 ) -> None:
     provenance = source_manifest.get("episodes")
     if not isinstance(provenance, list) or len(provenance) != 1903:
@@ -188,6 +340,7 @@ def audit_v21_videos(
         "schema": "egovla-v21-video-audit-v1",
         "created_at_utc": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "workers": workers,
+        "source_boundary_audit": source_boundary_audit,
         "cameras": {},
     }
     for key, jobs in jobs_by_key.items():
@@ -325,6 +478,13 @@ def convert(
 
     try:
         staging.mkdir(parents=True, exist_ok=False)
+        source_boundary_audit = audit_source_video_boundaries(
+            source,
+            episode_records,
+            video_keys,
+            converter,
+            video_workers,
+        )
         converter.convert_info(source, staging, episode_records, video_keys)
         converter.copy_global_stats(source, staging)
         converter.convert_tasks(source, staging)
@@ -340,6 +500,7 @@ def convert(
             video_workers,
             source_manifest,
             raw_source,
+            source_boundary_audit,
         )
 
         source_manifest = source / "meta" / "xpolicylab_conversion.json"

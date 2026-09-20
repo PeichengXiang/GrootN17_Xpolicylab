@@ -303,6 +303,7 @@ def _extract_video_segment(
     dst: Path,
     start: float,
     end: float,
+    expected_frames: int,
 ) -> None:
     # Validate paths to prevent security issues
     _validate_video_paths(src, dst)
@@ -314,6 +315,8 @@ def _extract_video_segment(
         raise ValueError(f"Invalid end time: {end}")
     if start >= end:
         raise ValueError(f"Start time {start} must be less than end time {end}")
+    if expected_frames <= 0:
+        raise ValueError(f"Expected frame count must be positive, got {expected_frames}")
 
     duration = max(end - start, MIN_VIDEO_DURATION)
 
@@ -335,8 +338,13 @@ def _extract_video_segment(
         str(src),
         "-t",
         f"{duration:.6f}",
+        "-map",
+        "0:v:0",
+        "-frames:v",
+        str(expected_frames),
         "-c",
         "copy",
+        "-an",
         "-avoid_negative_ts",
         "1",
         "-y",
@@ -403,6 +411,9 @@ def convert_videos(
                 episode_index = int(record["episode_index"])
                 start = float(record[f"videos/{video_key}/from_timestamp"])
                 end = float(record[f"videos/{video_key}/to_timestamp"])
+                expected_frames = int(record["dataset_to_index"]) - int(
+                    record["dataset_from_index"]
+                )
 
                 dest_chunk = episode_index // chunks_size
                 dest_path = new_root / LEGACY_VIDEO_PATH_TEMPLATE.format(
@@ -411,7 +422,13 @@ def convert_videos(
                     episode_index=episode_index,
                 )
 
-                _extract_video_segment(src_path, dest_path, start=start, end=end)
+                _extract_video_segment(
+                    src_path,
+                    dest_path,
+                    start=start,
+                    end=end,
+                    expected_frames=expected_frames,
+                )
 
 
 def convert_episodes_metadata(new_root: Path, episode_records: list[dict[str, Any]]) -> None:
